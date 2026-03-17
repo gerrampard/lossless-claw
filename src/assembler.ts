@@ -211,7 +211,8 @@ function tryRestoreOpenAIReasoning(raw: Record<string, unknown>): Record<string,
   return null;
 }
 
-function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
+/** @internal Exported for testing only. */
+export function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
   const type =
     rawType === "function_call" ||
     rawType === "functionCall" ||
@@ -245,7 +246,10 @@ function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unkno
   }
 
   if (input !== undefined) {
-    if (type === "functionCall") {
+    // toolCall and functionCall use "arguments" (consumed by OpenAI/xAI Chat
+    // Completions extractToolCalls and Responses API paths in OpenClaw).
+    // tool_use and variants use "input" (Anthropic native format).
+    if (type === "functionCall" || type === "toolCall") {
       block.arguments = input;
     } else {
       block.input = input;
@@ -254,16 +258,39 @@ function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unkno
   return block;
 }
 
-function toolResultBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
+/** @internal Exported for testing only. */
+export function toolResultBlockFromPart(
+  part: MessagePartRecord,
+  rawType?: string,
+  raw?: Record<string, unknown>,
+): unknown {
   const type =
     rawType === "function_call_output" || rawType === "toolResult" || rawType === "tool_result"
       ? rawType
       : "tool_result";
-  const output = parseStoredValue(part.toolOutput) ?? part.textContent ?? "";
-  const block: Record<string, unknown> = { type, output };
+  const output = parseStoredValue(part.toolOutput);
+  const block: Record<string, unknown> = { type };
 
   if (typeof part.toolName === "string" && part.toolName.length > 0) {
     block.name = part.toolName;
+  }
+
+  if (output !== undefined) {
+    block.output = output;
+  } else if (typeof part.textContent === "string") {
+    block.output = part.textContent;
+  } else if (raw && raw.output !== undefined) {
+    block.output = raw.output;
+  } else if (raw && raw.content !== undefined) {
+    block.content = raw.content;
+  } else {
+    block.output = "";
+  }
+
+  if (raw && typeof raw.is_error === "boolean") {
+    block.is_error = raw.is_error;
+  } else if (raw && typeof raw.isError === "boolean") {
+    block.isError = raw.isError;
   }
 
   if (type === "function_call_output") {
@@ -307,14 +334,34 @@ function toRuntimeRole(
   return "user"; // user | system
 }
 
-function blockFromPart(part: MessagePartRecord): unknown {
+/** @internal Exported for testing only. */
+export function blockFromPart(part: MessagePartRecord): unknown {
   const metadata = getPartMetadata(part);
   if (metadata.raw && typeof metadata.raw === "object") {
     // If this is an OpenClaw-normalised OpenAI reasoning block, restore the original
     // OpenAI format so the Responses API gets the {type:"reasoning", id:"rs_…"} it expects.
     const restored = tryRestoreOpenAIReasoning(metadata.raw as Record<string, unknown>);
     if (restored) return restored;
-    return metadata.raw;
+
+    // Don't return raw for tool call/result blocks — they need to go through
+    // toolCallBlockFromPart/toolResultBlockFromPart which properly normalize
+    // arguments (stringify if object) and format for the target provider.
+    // Returning raw here causes arguments to be passed as a JS object instead
+    // of a JSON string, which breaks xAI/OpenAI Chat Completions API (422).
+    const rawType = (metadata.raw as Record<string, unknown>).type as string | undefined;
+    const isToolBlock =
+      rawType === "toolCall" ||
+      rawType === "tool_use" ||
+      rawType === "tool-use" ||
+      rawType === "toolUse" ||
+      rawType === "functionCall" ||
+      rawType === "function_call" ||
+      rawType === "function_call_output" ||
+      rawType === "toolResult" ||
+      rawType === "tool_result";
+    if (!isToolBlock) {
+      return metadata.raw;
+    }
   }
 
   if (part.partType === "reasoning") {
@@ -322,7 +369,13 @@ function blockFromPart(part: MessagePartRecord): unknown {
   }
   if (part.partType === "tool") {
     if (metadata.originalRole === "toolResult" || metadata.rawType === "function_call_output") {
-      return toolResultBlockFromPart(part, metadata.rawType);
+      return toolResultBlockFromPart(
+        part,
+        metadata.rawType,
+        metadata.raw && typeof metadata.raw === "object"
+          ? (metadata.raw as Record<string, unknown>)
+          : undefined,
+      );
     }
     return toolCallBlockFromPart(part, metadata.rawType);
   }
@@ -341,7 +394,13 @@ function blockFromPart(part: MessagePartRecord): unknown {
     metadata.rawType === "tool_result" ||
     metadata.rawType === "toolResult"
   ) {
-    return toolResultBlockFromPart(part, metadata.rawType);
+    return toolResultBlockFromPart(
+      part,
+      metadata.rawType,
+      metadata.raw && typeof metadata.raw === "object"
+        ? (metadata.raw as Record<string, unknown>)
+        : undefined,
+    );
   }
   if (part.partType === "text") {
     return { type: "text", text: part.textContent ?? "" };
@@ -737,7 +796,7 @@ export class ContextAssembler {
     const content = contentFromParts(parts, role, msg.content);
     const contentText =
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
-    const tokenCount = msg.tokenCount > 0 ? msg.tokenCount : estimateTokens(contentText);
+    const tokenCount = estimateTokens(contentText);
 
     // Cast: these are reconstructed from DB storage, not live agent messages,
     // so they won't carry the full AgentMessage metadata (timestamp, usage, etc.)
