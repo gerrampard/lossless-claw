@@ -1,5 +1,5 @@
 ---
-"@martian-engineering/lossless-claw": patch
+"@martian-engineering/lossless-claw": minor
 ---
 
 Add session scoping controls for ignored and stateless OpenClaw sessions,

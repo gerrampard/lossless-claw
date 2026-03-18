@@ -1,6 +1,6 @@
 ---
-"@martian-engineering/lossless-claw": patch
+"@martian-engineering/lossless-claw": minor
 ---
 
-Forward delegated `lcm_expand_query` provider and model overrides to OpenClaw subagent runs.
-This fixes expansion override settings that were parsed from config but not applied at runtime.
+Add `expansionModel` and `expansionProvider` overrides for delegated
+`lcm_expand_query` subagent runs.
