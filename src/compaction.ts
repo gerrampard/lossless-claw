@@ -142,6 +142,14 @@ function generateSummaryId(content: string): string {
 /** Maximum characters for the deterministic fallback truncation (512 tokens * 4 chars). */
 const FALLBACK_MAX_CHARS = 512 * 4;
 const DEFAULT_LEAF_CHUNK_TOKENS = 20_000;
+
+/**
+ * Pattern matching MEDIA:/... file path references that appear in message content
+ * when the original message contained only a media attachment (image, file, etc.)
+ * with no meaningful text.
+ */
+const MEDIA_PATH_RE = /^MEDIA:\/.+$/;
+
 const CONDENSED_MIN_INPUT_RATIO = 0.1;
 
 function dedupeOrderedIds(ids: Iterable<string>): string[] {
@@ -1043,6 +1051,47 @@ export class CompactionEngine {
     return { content: summaryText, level };
   }
 
+  // ── Private: Media Annotation ────────────────────────────────────────────
+
+  /**
+   * Annotate a message's content with media context when it has file/media
+   * attachments. This gives the summarizer enough context to produce a
+   * meaningful summary instead of trying to compress raw file paths.
+   *
+   * - Media-only messages (just a file path, no text): content is replaced
+   *   with "[Media attachment]" or "[Image attachment]" etc.
+   * - Media-mostly messages (any real text + attachment): content is annotated
+   *   with " [with media attachment]" suffix.
+   * - Text-only messages: returned unchanged.
+   */
+  private async annotateMediaContent(
+    messageId: number,
+    content: string,
+  ): Promise<string> {
+    const parts = await this.conversationStore.getMessageParts(messageId);
+    const hasMediaParts = parts.some(
+      (p) => p.partType === "file" || p.partType === "snapshot",
+    );
+    if (!hasMediaParts) {
+      return content;
+    }
+
+    // Strip MEDIA:/... paths to see how much actual text remains
+    const textWithoutPaths = content
+      .split("\n")
+      .filter((line) => !MEDIA_PATH_RE.test(line.trim()))
+      .join("\n")
+      .trim();
+
+    if (textWithoutPaths.length === 0) {
+      // Media-only: replace with descriptive annotation
+      return "[Media attachment]";
+    }
+
+    // Media-mostly: keep the text, add annotation
+    return `${textWithoutPaths} [with media attachment]`;
+  }
+
   // ── Private: Leaf Pass ───────────────────────────────────────────────────
 
   /**
@@ -1064,9 +1113,13 @@ export class CompactionEngine {
       }
       const msg = await this.conversationStore.getMessageById(item.messageId);
       if (msg) {
+        const annotatedContent = await this.annotateMediaContent(
+          msg.messageId,
+          msg.content,
+        );
         messageContents.push({
           messageId: msg.messageId,
-          content: msg.content,
+          content: annotatedContent,
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
         });
