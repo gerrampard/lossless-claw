@@ -18,6 +18,7 @@ export type CreateSummaryInput = {
   descendantCount?: number;
   descendantTokenCount?: number;
   sourceMessageTokenCount?: number;
+  model?: string;
 };
 
 export type SummaryRecord = {
@@ -33,6 +34,7 @@ export type SummaryRecord = {
   descendantCount: number;
   descendantTokenCount: number;
   sourceMessageTokenCount: number;
+  model: string;
   createdAt: Date;
 };
 
@@ -125,6 +127,7 @@ interface SummaryRow {
   descendant_count: number | null;
   descendant_token_count: number | null;
   source_message_token_count: number | null;
+  model: string | null;
   created_at: string;
 }
 
@@ -227,6 +230,7 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
       row.source_message_token_count >= 0
         ? Math.floor(row.source_message_token_count)
         : 0,
+    model: typeof row.model === "string" ? row.model : "unknown",
     createdAt: new Date(row.created_at),
   };
 }
@@ -337,9 +341,10 @@ export class SummaryStore {
           latest_at,
           descendant_count,
           descendant_token_count,
-          source_message_token_count
+          source_message_token_count,
+          model
         )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.summaryId,
@@ -354,13 +359,14 @@ export class SummaryStore {
         descendantCount,
         descendantTokenCount,
         sourceMessageTokenCount,
+        input.model ?? "unknown",
       );
 
     const row = this.db
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, created_at
-                , descendant_token_count, source_message_token_count
+                , descendant_token_count, source_message_token_count, model
        FROM summaries WHERE summary_id = ?`,
       )
       .get(input.summaryId) as unknown as SummaryRow;
@@ -388,7 +394,7 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, created_at
-                , descendant_token_count, source_message_token_count
+                , descendant_token_count, source_message_token_count, model
        FROM summaries WHERE summary_id = ?`,
       )
       .get(summaryId) as unknown as SummaryRow | undefined;
@@ -400,7 +406,7 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, created_at
-                , descendant_token_count, source_message_token_count
+                , descendant_token_count, source_message_token_count, model
        FROM summaries
        WHERE conversation_id = ?
        ORDER BY created_at`,
@@ -459,7 +465,7 @@ export class SummaryStore {
       .prepare(
         `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
                 s.file_ids, s.earliest_at, s.latest_at, s.descendant_count, s.created_at
-                , s.descendant_token_count, s.source_message_token_count
+                , s.descendant_token_count, s.source_message_token_count, s.model
        FROM summaries s
        JOIN summary_parents sp ON sp.summary_id = s.summary_id
        WHERE sp.parent_summary_id = ?
@@ -477,7 +483,7 @@ export class SummaryStore {
       .prepare(
         `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
                 s.file_ids, s.earliest_at, s.latest_at, s.descendant_count, s.created_at
-                , s.descendant_token_count, s.source_message_token_count
+                , s.descendant_token_count, s.source_message_token_count, s.model
        FROM summaries s
        JOIN summary_parents sp ON sp.parent_summary_id = s.summary_id
        WHERE sp.summary_id = ?
@@ -517,6 +523,7 @@ export class SummaryStore {
            s.descendant_count,
            s.descendant_token_count,
            s.source_message_token_count,
+           s.model,
            s.created_at,
            subtree.depth_from_root,
            subtree.parent_summary_id,
@@ -839,7 +846,7 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, descendant_token_count,
-                source_message_token_count, created_at
+                source_message_token_count, model, created_at
          FROM summaries
          ${whereClause}
          ORDER BY created_at DESC
@@ -894,7 +901,7 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, descendant_token_count,
-                source_message_token_count, created_at
+                source_message_token_count, model, created_at
          FROM summaries
          ${whereClause}
          ORDER BY created_at DESC`,
