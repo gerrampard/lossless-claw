@@ -37,6 +37,8 @@ export type LcmConfig = {
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
   expansionModel: string;
+  /** Max time to wait for delegated lcm_expand_query sub-agent completion. */
+  delegationTimeoutMs: number;
   autocompactDisabled: boolean;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
   timezone: string;
@@ -106,6 +108,10 @@ export function resolveLcmConfig(
   pluginConfig?: Record<string, unknown>,
 ): LcmConfig {
   const pc = pluginConfig ?? {};
+  const envDelegationTimeoutMs =
+    env.LCM_DELEGATION_TIMEOUT_MS !== undefined
+      ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
+      : undefined;
 
   return {
     enabled:
@@ -182,6 +188,7 @@ export function resolveLcmConfig(
       env.LCM_EXPANSION_PROVIDER?.trim() ?? toStr(pc.expansionProvider) ?? "",
     expansionModel:
       env.LCM_EXPANSION_MODEL?.trim() ?? toStr(pc.expansionModel) ?? "",
+    delegationTimeoutMs: envDelegationTimeoutMs ?? toNumber(pc.delegationTimeoutMs) ?? 120000,
     autocompactDisabled:
       env.LCM_AUTOCOMPACT_DISABLED !== undefined
         ? env.LCM_AUTOCOMPACT_DISABLED === "true"
