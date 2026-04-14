@@ -343,6 +343,7 @@ describe("Circuit Breaker", () => {
   it("should scope provider-backed breakers to the resolved provider/model", async () => {
     const config = createTestConfig({ circuitBreakerThreshold: 1 });
     const providerDeps = createTestDeps(config);
+    let summaryOrdinal = 0;
     providerDeps.complete = async (params) => {
       if (params.provider === "broken-provider") {
         throw new LcmProviderAuthError({
@@ -351,7 +352,12 @@ describe("Circuit Breaker", () => {
           failure: { statusCode: 401, message: "auth failed", missingModelRequestScope: false },
         });
       }
-      return { content: [{ type: "text", text: "Summary" }] };
+      return {
+        content: [{
+          type: "text",
+          text: `Summary ${params.provider ?? "unknown"} ${params.model ?? "unknown"} ${summaryOrdinal++}`,
+        }],
+      };
     };
 
     const scopedDb = new DatabaseSync(":memory:");
