@@ -742,6 +742,45 @@ function resolveProviderApiFromRuntimeConfig(
   return typeof api === "string" && api.trim() ? api.trim() : undefined;
 }
 
+/**
+ * Resolve the api family for a specific model from runtime config.
+ *
+ * Walks `models.providers.<provider>.models[]` looking for a matching id and
+ * returns its `api` field if declared. Lets users override the api per model
+ * (e.g. when a single provider name maps to differently-shaped endpoints).
+ */
+export function resolveModelApiFromRuntimeConfig(
+  runtimeConfig: unknown,
+  provider: string,
+  model: string,
+): string | undefined {
+  if (!isRecord(runtimeConfig)) {
+    return undefined;
+  }
+  const providers = (runtimeConfig as { models?: { providers?: Record<string, unknown> } }).models
+    ?.providers;
+  if (!providers || !isRecord(providers)) {
+    return undefined;
+  }
+  const value = findProviderConfigValue(providers, provider);
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const models = value.models;
+  if (!Array.isArray(models)) {
+    return undefined;
+  }
+  const target = model.trim();
+  for (const entry of models) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry.id !== "string") continue;
+    if (entry.id.trim() !== target) continue;
+    const api = entry.api;
+    return typeof api === "string" && api.trim() ? api.trim() : undefined;
+  }
+  return undefined;
+}
+
 /** Resolve runtime.modelAuth from plugin runtime when available. */
 function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
   const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
@@ -1535,12 +1574,22 @@ function createLcmDependencies(
 
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
-        const fallbackApi =
-          (isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
-            ? knownModel.api.trim()
-            : undefined) ||
+        const modelRuntimeApi = resolveModelApiFromRuntimeConfig(
+          effectiveRuntimeConfig,
+          providerId,
+          modelId,
+        );
+        const providerRuntimeApi =
           providerApi?.trim() ||
-          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
+          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId);
+        const knownModelApi =
+          isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
+            ? knownModel.api.trim()
+            : undefined;
+        const fallbackApi =
+          modelRuntimeApi ||
+          providerRuntimeApi ||
+          knownModelApi ||
           (() => {
             if (typeof mod.getModels !== "function") {
               return undefined;
@@ -1584,10 +1633,7 @@ function createLcmDependencies(
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api:
-                  typeof providerLevelConfig.api === "string" && providerLevelConfig.api.trim()
-                    ? providerLevelConfig.api.trim()
-                    : knownModel.api,
+                api: modelRuntimeApi || providerRuntimeApi || knownModel.api,
                 // Provider config must be able to override built-in transport defaults.
                 // Otherwise built-in providers like `openai` keep their catalog baseUrl
                 // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
