@@ -2018,12 +2018,16 @@ export class LcmContextEngine implements ContextEngine {
     return telemetry.turnsSinceLeafCompaction <= HOT_CACHE_HYSTERESIS_TURNS;
   }
 
-  /** Treat weak observed cache reuse as cold, even if older telemetry still looks hot. */
+  /** Treat weak observed cache reuse without a cache write as cold, even if older telemetry still looks hot. */
   private isObservedCacheReadShareCold(
     telemetry: ConversationCompactionTelemetryRecord | null,
   ): boolean {
     const cacheRead = telemetry?.lastObservedCacheRead;
+    const cacheWrite = telemetry?.lastObservedCacheWrite;
     const promptTokenCount = telemetry?.lastObservedPromptTokenCount;
+    if (typeof cacheWrite === "number" && Number.isFinite(cacheWrite) && cacheWrite > 0) {
+      return false;
+    }
     if (
       typeof cacheRead !== "number"
       || !Number.isFinite(cacheRead)
@@ -2089,13 +2093,23 @@ export class LcmContextEngine implements ContextEngine {
     return Math.max(1, this.config.cacheAwareCompaction.cacheTTLSeconds) * 1000;
   }
 
-  /** Detect Anthropic-family sessions where local prompt rewrites can invalidate a hot prefix cache. */
-  private isAnthropicPromptCacheFamily(
+  /** Detect prompt-cache families where local prompt rewrites can invalidate a hot prefix cache. */
+  private isPromptCacheMutationSensitiveFamily(
     telemetry: ConversationCompactionTelemetryRecord | null,
   ): boolean {
     const provider = telemetry?.provider?.trim().toLowerCase() ?? "";
     const model = telemetry?.model?.trim().toLowerCase() ?? "";
-    return provider.includes("anthropic") || model.includes("claude");
+    const identifiers = [provider, model];
+    return identifiers.some((identifier) =>
+      identifier.includes("anthropic")
+      || identifier.includes("claude")
+      || identifier.includes("openai-codex")
+      || identifier.includes("openai_codex")
+      || identifier.includes("github-copilot")
+      || identifier.includes("github_copilot")
+      || identifier.includes("codex-cli")
+      || identifier.includes("codex_cli")
+    );
   }
 
   /** Determine whether the last prompt-cache touch is still within the active TTL window. */
@@ -2118,16 +2132,45 @@ export class LcmContextEngine implements ContextEngine {
     return now.getTime() - touchAt.getTime() < ttlMs;
   }
 
-  /** Delay prompt-mutating deferred compaction while Anthropic's exact-prefix cache is still hot. */
+  private latestPromptCacheTouchSignalAt(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+  ): Date | null {
+    const candidates = [
+      telemetry?.lastCacheTouchAt,
+      telemetry?.lastObservedCacheHitAt,
+    ].filter((value): value is Date => value instanceof Date);
+    return candidates.reduce<Date | null>(
+      (latest, value) => (!latest || value > latest ? value : latest),
+      null,
+    );
+  }
+
+  /** Return true when an explicit prompt-cache break is newer than any cache touch signal. */
+  private hasFreshPromptCacheBreak(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+  ): boolean {
+    const lastCacheTouchSignalAt = this.latestPromptCacheTouchSignalAt(telemetry);
+    return Boolean(
+      telemetry?.lastObservedCacheBreakAt
+        && (
+          !lastCacheTouchSignalAt
+          || telemetry.lastObservedCacheBreakAt >= lastCacheTouchSignalAt
+        ),
+    );
+  }
+
+  /** Delay prompt-mutating deferred compaction while a mutation-sensitive prompt cache is hot. */
   private shouldDelayPromptMutatingDeferredCompaction(
     telemetry: ConversationCompactionTelemetryRecord | null,
     now: Date = new Date(),
   ): boolean {
-    return this.isAnthropicPromptCacheFamily(telemetry) && this.isPromptCacheStillHot(telemetry, now);
+    return this.isPromptCacheMutationSensitiveFamily(telemetry)
+      && !this.hasFreshPromptCacheBreak(telemetry)
+      && this.isPromptCacheStillHot(telemetry, now);
   }
 
-  /** Keep deferred Anthropic leaf debt moving once the TTL-safe cache hold has expired. */
-  private shouldForceDeferredAnthropicLeafCompaction(
+  /** Keep deferred mutation-sensitive leaf debt moving once the TTL-safe cache hold has expired. */
+  private shouldForceDeferredPromptCacheLeafCompaction(
     telemetry: ConversationCompactionTelemetryRecord | null,
     leafDecision: IncrementalCompactionDecision,
   ): boolean {
@@ -2140,18 +2183,18 @@ export class LcmContextEngine implements ContextEngine {
     ) {
       return false;
     }
-    if (!this.isAnthropicPromptCacheFamily(telemetry)) {
+    if (!this.isPromptCacheMutationSensitiveFamily(telemetry)) {
       return false;
     }
     return !this.shouldDelayPromptMutatingDeferredCompaction(telemetry);
   }
 
-  /** Use the post-TTL catch-up envelope when stale Anthropic debt must override hot-cache smoothing. */
+  /** Use the post-TTL catch-up envelope when stale cache debt must override hot-cache smoothing. */
   private resolveDeferredLeafCompactionExecutionDecision(params: {
     telemetry: ConversationCompactionTelemetryRecord | null;
     leafDecision: IncrementalCompactionDecision;
   }): IncrementalCompactionDecision {
-    if (!this.shouldForceDeferredAnthropicLeafCompaction(params.telemetry, params.leafDecision)) {
+    if (!this.shouldForceDeferredPromptCacheLeafCompaction(params.telemetry, params.leafDecision)) {
       return params.leafDecision;
     }
     return {
@@ -2356,6 +2399,8 @@ export class LcmContextEngine implements ContextEngine {
     if (sawExplicitBreak) {
       cacheState = "cold";
     } else if (typeof cacheRead === "number" && cacheRead > 0) {
+      cacheState = "hot";
+    } else if (typeof cacheWrite === "number" && cacheWrite > 0) {
       cacheState = "hot";
     } else if (hasUsageSignal || hasObservationSignal) {
       cacheState = "cold";
@@ -2906,7 +2951,7 @@ export class LcmContextEngine implements ContextEngine {
                   };
                 }
                 this.deps.log.info(
-                  `[lcm] maintain: deferred Anthropic leaf debt ignoring effective hot-cache state after TTL expiry conversation=${params.conversationId} ${sessionLabel} reason=${leafDecision.reason} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
+                  `[lcm] maintain: deferred prompt-cache leaf debt ignoring effective hot-cache state after TTL expiry conversation=${params.conversationId} ${sessionLabel} reason=${leafDecision.reason} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
                 );
               }
               return this.executeLeafCompactionCore({
