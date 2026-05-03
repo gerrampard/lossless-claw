@@ -493,7 +493,33 @@ describe("createLcmDependencies.complete provider config resolution", () => {
         id: "kimi-k2.5:cloud",
         provider: "ollama",
         api: "openai-completions",
-        baseUrl: "",
+        baseUrl: "http://localhost:11434",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it.each([
+    ["deepseek", "https://api.deepseek.com"],
+    ["groq", "https://api.groq.com/openai/v1"],
+    ["mistral", "https://api.mistral.ai"],
+    ["openrouter", "https://openrouter.ai/api/v1"],
+    ["together", "https://api.together.xyz"],
+  ])("falls back to OpenAI-compatible routing for %s", async (provider, baseUrl) => {
+    await callComplete({
+      loadConfigResult: {},
+      provider,
+      model: "unit-model",
+      runtimeConfig: {},
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "unit-model",
+        provider,
+        api: "openai-completions",
+        baseUrl,
       }),
       expect.any(Object),
       expect.any(Object),

@@ -707,7 +707,8 @@ function resolveProviderModelBaseUrl(params: {
     typeof params.configuredBaseUrl === "string" ? params.configuredBaseUrl : undefined;
   const fallbackBaseUrl =
     typeof params.fallbackBaseUrl === "string" ? params.fallbackBaseUrl : undefined;
-  const baseUrl = configuredBaseUrl ?? fallbackBaseUrl ?? "";
+  const baseUrl =
+    configuredBaseUrl ?? fallbackBaseUrl ?? inferBaseUrlFromProvider(params.provider) ?? "";
   return shouldUseNativeCodexBaseUrl({ provider: params.provider, api: params.api, baseUrl })
     ? OPENAI_CODEX_RESPONSES_BASE_URL
     : baseUrl;
@@ -747,9 +748,14 @@ function inferApiFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
     anthropic: "anthropic-messages",
+    deepseek: "openai-completions",
+    groq: "openai-completions",
+    mistral: "openai-completions",
     openai: "openai-responses",
     [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_RESPONSES_API,
     "github-copilot": OPENAI_CODEX_RESPONSES_API,
+    openrouter: "openai-completions",
+    together: "openai-completions",
     google: "google-generative-ai",
     "google-gemini-cli": "google-gemini-cli",
     "google-antigravity": "google-gemini-cli",
@@ -763,6 +769,24 @@ function inferApiFromProvider(provider: string): string | undefined {
 /** Codex Responses rejects `temperature`; omit it for that API family. */
 export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
   return isOpenAICodexResponsesApi(api);
+}
+
+/** Resolve known provider base URLs when model lookup misses. */
+function inferBaseUrlFromProvider(provider: string): string | undefined {
+  const normalized = normalizeProviderId(provider);
+  const map: Record<string, string> = {
+    anthropic: "https://api.anthropic.com",
+    deepseek: "https://api.deepseek.com",
+    openai: "https://api.openai.com/v1",
+    "openai-codex": "https://api.openai.com/v1",
+    google: "https://generativelanguage.googleapis.com/v1beta",
+    groq: "https://api.groq.com/openai/v1",
+    mistral: "https://api.mistral.ai",
+    together: "https://api.together.xyz",
+    openrouter: "https://openrouter.ai/api/v1",
+    ollama: "http://localhost:11434",
+  };
+  return map[normalized];
 }
 
 /** Build provider-aware options for pi-ai completeSimple. */
