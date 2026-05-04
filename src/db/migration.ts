@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "./features.js";
+import { buildMessageIdentityHash } from "../store/message-identity.js";
 import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
 
 type MigrationLogger = {
@@ -35,6 +36,12 @@ type TableNameRow = {
   name?: string;
 };
 
+type MessageIdentityBackfillRow = {
+  message_id: number;
+  role: string;
+  content: string;
+};
+
 type FtsTableSpec = {
   tableName: string;
   createSql: string;
@@ -42,6 +49,14 @@ type FtsTableSpec = {
   expectedColumns: string[];
   staleSchemaPatterns?: string[];
 };
+
+const VERSIONED_BACKFILL_STEPS = {
+  backfillSummaryDepths: 1,
+  backfillSummaryMetadata: 1,
+  backfillToolCallColumns: 1,
+} as const;
+
+type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
 
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
   const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
@@ -96,13 +111,28 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
 
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const hasConsecutiveColdObservations = telemetryColumns.some(
+    (col) => col.name === "consecutive_cold_observations",
+  );
   const hasLastLeafCompactionAt = telemetryColumns.some((col) => col.name === "last_leaf_compaction_at");
   const hasTurnsSinceLeafCompaction = telemetryColumns.some((col) => col.name === "turns_since_leaf_compaction");
   const hasTokensAccumulatedSinceLeafCompaction = telemetryColumns.some(
     (col) => col.name === "tokens_accumulated_since_leaf_compaction",
   );
   const hasLastActivityBand = telemetryColumns.some((col) => col.name === "last_activity_band");
+  const hasLastApiCallAt = telemetryColumns.some((col) => col.name === "last_api_call_at");
+  const hasLastCacheTouchAt = telemetryColumns.some((col) => col.name === "last_cache_touch_at");
+  const hasProvider = telemetryColumns.some((col) => col.name === "provider");
+  const hasModel = telemetryColumns.some((col) => col.name === "model");
+  const hasLastObservedPromptTokenCount = telemetryColumns.some(
+    (col) => col.name === "last_observed_prompt_token_count",
+  );
 
+  if (!hasConsecutiveColdObservations) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN consecutive_cold_observations INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
   if (!hasLastLeafCompactionAt) {
     db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_leaf_compaction_at TEXT`);
   }
@@ -120,6 +150,141 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
     db.exec(
       `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`,
     );
+  }
+  if (!hasLastApiCallAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_api_call_at TEXT`);
+  }
+  if (!hasLastCacheTouchAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_cache_touch_at TEXT`);
+  }
+  if (!hasProvider) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN provider TEXT`);
+  }
+  if (!hasModel) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN model TEXT`);
+  }
+  if (!hasLastObservedPromptTokenCount) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_observed_prompt_token_count INTEGER`);
+  }
+}
+
+/**
+ * Belt-and-suspenders guard: create `message_parts` if it does not yet exist.
+ *
+ * `message_parts` is defined inside the large `db.exec()` block in
+ * `runLcmMigrations`.  On some Node.js SQLite builds (particularly
+ * `node:sqlite` before v22.12) a syntax error or constraint-check mismatch
+ * anywhere in that block causes the exec to stop early, silently leaving
+ * tables that appear later in the string uncreated.  Any subsequent INSERT
+ * into `message_parts` then throws "no such table".
+ *
+ * This function probes `sqlite_master` directly and creates the table +
+ * indexes when absent, matching the pattern used for column guards
+ * (`ensureSummaryDepthColumn`, `ensureMessageIdentityHashColumn`, …).
+ */
+function ensureMessagePartsTable(db: DatabaseSync): void {
+  const tables = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_parts'`)
+    .all() as { name: string }[];
+  if (tables.length > 0) return;
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS message_parts (
+      part_id TEXT PRIMARY KEY,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      part_type TEXT NOT NULL CHECK (part_type IN (
+        'text', 'reasoning', 'tool', 'patch', 'file',
+        'subtask', 'compaction', 'step_start', 'step_finish',
+        'snapshot', 'agent', 'retry'
+      )),
+      ordinal INTEGER NOT NULL,
+      text_content TEXT,
+      is_ignored INTEGER,
+      is_synthetic INTEGER,
+      tool_call_id TEXT,
+      tool_name TEXT,
+      tool_status TEXT,
+      tool_input TEXT,
+      tool_output TEXT,
+      tool_error TEXT,
+      tool_title TEXT,
+      patch_hash TEXT,
+      patch_files TEXT,
+      file_mime TEXT,
+      file_name TEXT,
+      file_url TEXT,
+      subtask_prompt TEXT,
+      subtask_desc TEXT,
+      subtask_agent TEXT,
+      step_reason TEXT,
+      step_cost REAL,
+      step_tokens_in INTEGER,
+      step_tokens_out INTEGER,
+      snapshot_hash TEXT,
+      compaction_auto INTEGER,
+      metadata TEXT,
+      UNIQUE (message_id, ordinal)
+    )
+  `);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type)`,
+  );
+}
+
+function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
+  if (!hasIdentityHash) {
+    db.exec(`ALTER TABLE messages ADD COLUMN identity_hash TEXT`);
+  }
+}
+
+function backfillMessageIdentityHashes(
+  db: DatabaseSync,
+  options?: { managesOwnTransaction?: boolean },
+): void {
+  const selectStmt = db.prepare(
+    `SELECT message_id, role, content
+     FROM messages
+     WHERE message_id > ?
+       AND (identity_hash IS NULL OR identity_hash = '')
+     ORDER BY message_id
+     LIMIT ?`,
+  );
+  const updateStmt = db.prepare(`UPDATE messages SET identity_hash = ? WHERE message_id = ?`);
+  let lastProcessedMessageId = 0;
+  const managesOwnTransaction = options?.managesOwnTransaction ?? true;
+
+  while (true) {
+    const rows = selectStmt.all(lastProcessedMessageId, 1_000) as MessageIdentityBackfillRow[];
+    if (rows.length === 0) {
+      return;
+    }
+    if (managesOwnTransaction) {
+      db.exec(`BEGIN`);
+    }
+    try {
+      for (const row of rows) {
+        updateStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
+      }
+      if (managesOwnTransaction) {
+        db.exec(`COMMIT`);
+      }
+    } catch (error) {
+      if (managesOwnTransaction) {
+        try {
+          db.exec(`ROLLBACK`);
+        } catch {
+          // Preserve the original migration failure if rollback also errors.
+        }
+      }
+      throw error;
+    }
+    lastProcessedMessageId = rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
   }
 }
 
@@ -141,6 +306,82 @@ function runMigrationStep(
   } catch (error) {
     log?.info?.(
       `[lcm] migration step failed: step=${name} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
+    );
+    throw error;
+  }
+}
+
+function getVersionedBackfillSavepointName(stepName: VersionedBackfillStepName): string {
+  return `lcm_backfill_${stepName}`;
+}
+
+function hasCompletedVersionedBackfill(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  algorithmVersion: number,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1
+       FROM lcm_migration_state
+       WHERE step_name = ? AND algorithm_version = ?
+       LIMIT 1`,
+    )
+    .get(stepName, algorithmVersion) as { 1?: number } | undefined;
+  return row != null;
+}
+
+function markVersionedBackfillComplete(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  algorithmVersion: number,
+): void {
+  db.prepare(
+    `INSERT INTO lcm_migration_state (step_name, algorithm_version, completed_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(step_name, algorithm_version)
+     DO UPDATE SET completed_at = excluded.completed_at`,
+  ).run(stepName, algorithmVersion);
+}
+
+function rollbackSavepoint(db: DatabaseSync, savepointName: string): void {
+  try {
+    db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+  } finally {
+    db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+  }
+}
+
+function runVersionedBackfillStep(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  log: MigrationLogger | undefined,
+  step: () => void,
+): void {
+  const algorithmVersion = VERSIONED_BACKFILL_STEPS[stepName];
+  if (hasCompletedVersionedBackfill(db, stepName, algorithmVersion)) {
+    log?.info?.(
+      `[lcm] migration step skipped: step=${stepName} algorithmVersion=${algorithmVersion} reason=already-complete`,
+    );
+    return;
+  }
+
+  const startedAt = Date.now();
+  const savepointName = getVersionedBackfillSavepointName(stepName);
+
+  db.exec(`SAVEPOINT ${savepointName}`);
+
+  try {
+    step();
+    markVersionedBackfillComplete(db, stepName, algorithmVersion);
+    db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+    log?.info?.(
+      `[lcm] migration step complete: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt}`,
+    );
+  } catch (error) {
+    rollbackSavepoint(db, savepointName);
+    log?.info?.(
+      `[lcm] migration step failed: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
     );
     throw error;
   }
@@ -566,7 +807,12 @@ export function runLcmMigrations(
   options?: { fts5Available?: boolean; log?: MigrationLogger },
 ): void {
   const log = options?.log;
-  db.exec(`
+  let transactionActive = false;
+  db.exec(`BEGIN EXCLUSIVE`);
+  transactionActive = true;
+
+  try {
+    db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
@@ -586,6 +832,7 @@ export function runLcmMigrations(
       role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
+      identity_hash TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (conversation_id, seq)
     );
@@ -697,17 +944,44 @@ export function runLcmMigrations(
       conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
       last_observed_cache_read INTEGER,
       last_observed_cache_write INTEGER,
+      last_observed_prompt_token_count INTEGER,
       last_observed_cache_hit_at TEXT,
       last_observed_cache_break_at TEXT,
       cache_state TEXT NOT NULL DEFAULT 'unknown'
         CHECK (cache_state IN ('hot', 'cold', 'unknown')),
+      consecutive_cold_observations INTEGER NOT NULL DEFAULT 0,
       retention TEXT,
       last_leaf_compaction_at TEXT,
       turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
       tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
       last_activity_band TEXT NOT NULL DEFAULT 'low'
         CHECK (last_activity_band IN ('low', 'medium', 'high')),
+      last_api_call_at TEXT,
+      last_cache_touch_at TEXT,
+      provider TEXT,
+      model TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_compaction_maintenance (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      pending INTEGER NOT NULL DEFAULT 0,
+      requested_at TEXT,
+      reason TEXT,
+      running INTEGER NOT NULL DEFAULT 0,
+      last_started_at TEXT,
+      last_finished_at TEXT,
+      last_failure_summary TEXT,
+      token_budget INTEGER,
+      current_token_count INTEGER,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS lcm_migration_state (
+      step_name TEXT NOT NULL,
+      algorithm_version INTEGER NOT NULL,
+      completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (step_name, algorithm_version)
     );
 
     -- Indexes
@@ -728,141 +1002,173 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
   `);
 
-  // Forward-compatible conversations migration for existing DBs.
-  const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
-    name?: string;
-  }>;
-  const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
-  if (!hasBootstrappedAt) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
-  }
-
-  const hasSessionKey = conversationColumns.some((col) => col.name === "session_key");
-  if (!hasSessionKey) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);
-  }
-
-  const hasActive = conversationColumns.some((col) => col.name === "active");
-  if (!hasActive) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN active INTEGER NOT NULL DEFAULT 1`);
-  }
-
-  const hasArchivedAt = conversationColumns.some((col) => col.name === "archived_at");
-  if (!hasArchivedAt) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
-  }
-
-  db.exec(`UPDATE conversations SET active = 1 WHERE active IS NULL`);
-  db.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS conversations_active_session_key_idx
-    ON conversations (session_key)
-    WHERE session_key IS NOT NULL AND active = 1
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx
-    ON conversations (session_key, active, created_at)
-  `);
-  db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
-  runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
-  runMigrationStep("ensureSummaryMetadataColumns", log, () =>
-    ensureSummaryMetadataColumns(db),
-  );
-  runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
-  runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
-    ensureCompactionTelemetryColumns(db),
-  );
-  runMigrationStep("backfillSummaryDepths", log, () => backfillSummaryDepths(db));
-  // Index on depth — created AFTER backfillSummaryDepths to avoid index
-  // maintenance overhead during bulk depth updates on large existing DBs.
-  runMigrationStep("createSummariesDepthIndex", log, () =>
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
-    ),
-  );
-  runMigrationStep("backfillSummaryMetadata", log, () => backfillSummaryMetadata(db));
-  runMigrationStep("backfillToolCallColumns", log, () => backfillToolCallColumns(db));
-
-  const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
-  const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
-  if (!fts5Available) {
-    return;
-  }
-
-  const trigramTokenizerAvailable = detectedFeatures?.trigramTokenizerAvailable ?? false;
-  if (!trigramTokenizerAvailable) {
-    try {
-      db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
-    } catch {
-      // Best effort only. A stale virtual table should not block core migration.
+    // Forward-compatible conversations migration for existing DBs.
+    const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
+      name?: string;
+    }>;
+    const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
+    if (!hasBootstrappedAt) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
     }
-  }
 
-  // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
-  runMigrationStep("ensureMessagesFts", log, () => {
-    ensureStandaloneFtsTable(db, {
-      tableName: "messages_fts",
-      createSql: `
-        CREATE VIRTUAL TABLE messages_fts USING fts5(
-          content,
-          tokenize='porter unicode61'
-        )
-      `,
-      seedSql: `
-        INSERT INTO messages_fts(rowid, content)
-        SELECT message_id, content FROM messages
-      `,
-      expectedColumns: ["content"],
-      staleSchemaPatterns: ["content_rowid"],
-    });
-  });
+    const hasSessionKey = conversationColumns.some((col) => col.name === "session_key");
+    if (!hasSessionKey) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);
+    }
 
-  runMigrationStep("ensureSummariesFts", log, () => {
-    ensureStandaloneFtsTable(db, {
-      tableName: "summaries_fts",
-      createSql: `
-        CREATE VIRTUAL TABLE summaries_fts USING fts5(
-          summary_id UNINDEXED,
-          content,
-          tokenize='porter unicode61'
-        )
-      `,
-      seedSql: `
-        INSERT INTO summaries_fts(summary_id, content)
-        SELECT summary_id, content FROM summaries
-      `,
-      expectedColumns: ["summary_id", "content"],
-      staleSchemaPatterns: [
-        "content_rowid='summary_id'",
-        'content_rowid="summary_id"',
-      ],
-    });
-  });
+    const hasActive = conversationColumns.some((col) => col.name === "active");
+    if (!hasActive) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN active INTEGER NOT NULL DEFAULT 1`);
+    }
 
-  // ── CJK trigram FTS table ────────────────────────────────────────────────
-  // FTS5 unicode61 (porter) tokenizer cannot segment CJK ideographs, so CJK
-  // queries currently fall back to a LIKE path with AND logic.  When the user's
-  // phrasing doesn't match the summary verbatim (e.g. "端到端测试结果" vs
-  // "端到端测试"), ALL terms must match and the query returns 0 candidates.
-  //
-  // A trigram-tokenized table indexes every 3-character substring, enabling
-  // native CJK substring matching via FTS5 MATCH with OR semantics.
-  runMigrationStep("ensureSummariesFtsCjk", log, () => {
-    if (trigramTokenizerAvailable) {
-      ensureStandaloneFtsTable(db, {
-        tableName: "summaries_fts_cjk",
-        createSql: `
-          CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
-            summary_id UNINDEXED,
-            content,
-            tokenize='trigram'
-          )
-        `,
-        seedSql: `
-          INSERT INTO summaries_fts_cjk(summary_id, content)
-          SELECT summary_id, content FROM summaries
-        `,
-        expectedColumns: ["summary_id", "content"],
+    const hasArchivedAt = conversationColumns.some((col) => col.name === "archived_at");
+    if (!hasArchivedAt) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
+    }
+
+    db.exec(`UPDATE conversations SET active = 1 WHERE active IS NULL`);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS conversations_active_session_key_idx
+      ON conversations (session_key)
+      WHERE session_key IS NOT NULL AND active = 1
+    `);
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx
+      ON conversations (session_key, active, created_at)
+    `);
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS conversations_session_id_active_created_idx
+      ON conversations (session_id, active, created_at)
+    `);
+    db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
+    runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
+    runMigrationStep("ensureSummaryMetadataColumns", log, () =>
+      ensureSummaryMetadataColumns(db),
+    );
+    runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
+    runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
+      ensureMessageIdentityHashColumn(db),
+    );
+    // Belt-and-suspenders: ensure message_parts exists even if the bulk
+    // CREATE TABLE block above was interrupted before reaching it.
+    runMigrationStep("ensureMessagePartsTable", log, () => ensureMessagePartsTable(db));
+    runMigrationStep("backfillMessageIdentityHashes", log, () =>
+      backfillMessageIdentityHashes(db, { managesOwnTransaction: false }),
+    );
+    runMigrationStep("createMessagesIdentityHashIndex", log, () =>
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`,
+      ),
+    );
+    runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
+      ensureCompactionTelemetryColumns(db),
+    );
+    runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));
+    // Index on depth — created AFTER backfillSummaryDepths to avoid index
+    // maintenance overhead during bulk depth updates on large existing DBs.
+    runMigrationStep("createSummariesDepthIndex", log, () =>
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
+      ),
+    );
+    runVersionedBackfillStep(db, "backfillSummaryMetadata", log, () =>
+      backfillSummaryMetadata(db),
+    );
+    runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
+      backfillToolCallColumns(db),
+    );
+
+    const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
+    const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
+    if (fts5Available) {
+      const trigramTokenizerAvailable = detectedFeatures?.trigramTokenizerAvailable ?? false;
+      if (!trigramTokenizerAvailable) {
+        try {
+          db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
+        } catch {
+          // Best effort only. A stale virtual table should not block core migration.
+        }
+      }
+
+      // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
+      runMigrationStep("ensureMessagesFts", log, () => {
+        ensureStandaloneFtsTable(db, {
+          tableName: "messages_fts",
+          createSql: `
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+              content,
+              tokenize='porter unicode61'
+            )
+          `,
+          seedSql: `
+            INSERT INTO messages_fts(rowid, content)
+            SELECT message_id, content FROM messages
+          `,
+          expectedColumns: ["content"],
+          staleSchemaPatterns: ["content_rowid"],
+        });
+      });
+
+      runMigrationStep("ensureSummariesFts", log, () => {
+        ensureStandaloneFtsTable(db, {
+          tableName: "summaries_fts",
+          createSql: `
+            CREATE VIRTUAL TABLE summaries_fts USING fts5(
+              summary_id UNINDEXED,
+              content,
+              tokenize='porter unicode61'
+            )
+          `,
+          seedSql: `
+            INSERT INTO summaries_fts(summary_id, content)
+            SELECT summary_id, content FROM summaries
+          `,
+          expectedColumns: ["summary_id", "content"],
+          staleSchemaPatterns: [
+            "content_rowid='summary_id'",
+            'content_rowid="summary_id"',
+          ],
+        });
+      });
+
+      // ── CJK trigram FTS table ────────────────────────────────────────────────
+      // FTS5 unicode61 (porter) tokenizer cannot segment CJK ideographs, so CJK
+      // queries currently fall back to a LIKE path with AND logic.  When the user's
+      // phrasing doesn't match the summary verbatim (e.g. "端到端测试结果" vs
+      // "端到端测试"), ALL terms must match and the query returns 0 candidates.
+      //
+      // A trigram-tokenized table indexes every 3-character substring, enabling
+      // native CJK substring matching via FTS5 MATCH with OR semantics.
+      runMigrationStep("ensureSummariesFtsCjk", log, () => {
+        if (trigramTokenizerAvailable) {
+          ensureStandaloneFtsTable(db, {
+            tableName: "summaries_fts_cjk",
+            createSql: `
+              CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
+                summary_id UNINDEXED,
+                content,
+                tokenize='trigram'
+              )
+            `,
+            seedSql: `
+              INSERT INTO summaries_fts_cjk(summary_id, content)
+              SELECT summary_id, content FROM summaries
+            `,
+            expectedColumns: ["summary_id", "content"],
+          });
+        }
       });
     }
-  });
+    db.exec(`COMMIT`);
+    transactionActive = false;
+  } catch (error) {
+    if (transactionActive) {
+      try {
+        db.exec(`ROLLBACK`);
+      } catch {
+        // Preserve the original migration failure if rollback also errors.
+      }
+    }
+    throw error;
+  }
 }

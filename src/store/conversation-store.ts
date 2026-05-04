@@ -1,8 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
+import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
+import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 
@@ -30,6 +32,7 @@ export type CreateMessageInput = {
   role: MessageRole;
   content: string;
   tokenCount: number;
+  identityHash?: string;
 };
 
 export type MessageRecord = {
@@ -90,6 +93,7 @@ export type ConversationRecord = {
 
 export type MessageSearchInput = {
   conversationId?: ConversationId;
+  conversationIds?: ConversationId[];
   query: string;
   mode: "regex" | "full_text";
   since?: Date;
@@ -218,6 +222,7 @@ function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
 }
 
 function normalizeMessageContentForFullTextIndex(content: string): string | null {
+  if (typeof content !== "string") return null;
   const trimmed = content.trim();
   if (!trimmed) {
     return null;
@@ -279,27 +284,43 @@ export class ConversationStore {
   // ── Conversation operations ───────────────────────────────────────────────
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
-    const result = this.db
-      .prepare(
-        `INSERT INTO conversations (session_id, session_key, active, archived_at, title)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(
-        input.sessionId,
-        input.sessionKey ?? null,
-        input.active === false ? 0 : 1,
-        input.archivedAt?.toISOString() ?? null,
-        input.title ?? null,
-      );
+    try {
+      const result = this.db
+        .prepare(
+          `INSERT INTO conversations (session_id, session_key, active, archived_at, title)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.sessionId,
+          input.sessionKey ?? null,
+          input.active === false ? 0 : 1,
+          input.archivedAt?.toISOString() ?? null,
+          input.title ?? null,
+        );
 
-    const row = this.db
-      .prepare(
-        `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
-       FROM conversations WHERE conversation_id = ?`,
-      )
-      .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
+      const row = this.db
+        .prepare(
+          `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
+         FROM conversations WHERE conversation_id = ?`,
+        )
+        .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
 
-    return toConversationRecord(row);
+      return toConversationRecord(row);
+    } catch (err: unknown) {
+      // Handle UNIQUE constraint race: another writer created the conversation first
+      if (
+        err instanceof Error &&
+        /UNIQUE constraint failed|SQLITE_CONSTRAINT_UNIQUE/i.test(err.message)
+      ) {
+        if (input.sessionKey) {
+          const existing = await this.getConversationBySessionKey(input.sessionKey);
+          if (existing) return existing;
+        }
+        const existing = await this.getConversationBySessionId(input.sessionId);
+        if (existing) return existing;
+      }
+      throw err;
+    }
   }
 
   async getConversation(conversationId: ConversationId): Promise<ConversationRecord | null> {
@@ -342,6 +363,46 @@ export class ConversationStore {
     return row ? toConversationRecord(row) : null;
   }
 
+  async getConversationFamilyIds(input: {
+    conversationId?: ConversationId;
+    sessionId?: string;
+    sessionKey?: string;
+  }): Promise<ConversationId[]> {
+    const baseConversation =
+      input.conversationId != null
+        ? await this.getConversation(input.conversationId)
+        : await this.getConversationForSession({
+            sessionId: input.sessionId,
+            sessionKey: input.sessionKey,
+          });
+    if (!baseConversation) {
+      return [];
+    }
+
+    const normalizedSessionKey = baseConversation.sessionKey?.trim();
+    if (normalizedSessionKey) {
+      const rows = this.db
+        .prepare(
+          `SELECT conversation_id
+           FROM conversations
+           WHERE session_key = ?
+           ORDER BY active DESC, created_at DESC, conversation_id DESC`,
+        )
+        .all(normalizedSessionKey) as Array<{ conversation_id: number }>;
+      return rows.map((row) => row.conversation_id);
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT conversation_id
+         FROM conversations
+         WHERE session_id = ?
+         ORDER BY active DESC, created_at DESC, conversation_id DESC`,
+      )
+      .all(baseConversation.sessionId) as Array<{ conversation_id: number }>;
+    return rows.map((row) => row.conversation_id);
+  }
+
   /** Resolve a conversation by stable session identity. */
   async getConversationForSession(input: {
     sessionId?: string;
@@ -361,6 +422,25 @@ export class ConversationStore {
     }
 
     return this.getConversationBySessionId(normalizedSessionId);
+  }
+
+  /** List active conversations that may own live session storage. */
+  async listActiveConversations(limit?: number): Promise<ConversationRecord[]> {
+    const normalizedLimit =
+      typeof limit === "number" && Number.isFinite(limit) && limit > 0
+        ? Math.floor(limit)
+        : 1000;
+    const rows = this.db
+      .prepare(
+        `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
+         FROM conversations
+         WHERE active = 1
+         ORDER BY updated_at DESC, conversation_id DESC
+         LIMIT ?`,
+      )
+      .all(normalizedLimit) as unknown as ConversationRow[];
+
+    return rows.map(toConversationRecord);
   }
 
   async getOrCreateConversation(
@@ -434,10 +514,17 @@ export class ConversationStore {
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const result = this.db
       .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count)
-       VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
+       VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.conversationId, input.seq, input.role, input.content, input.tokenCount);
+      .run(
+        input.conversationId,
+        input.seq,
+        input.role,
+        input.content,
+        input.tokenCount,
+        input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+      );
 
     const messageId = Number(result.lastInsertRowid);
 
@@ -458,8 +545,8 @@ export class ConversationStore {
       return [];
     }
     const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
+       VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
       `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
@@ -474,6 +561,7 @@ export class ConversationStore {
         input.role,
         input.content,
         input.tokenCount,
+        input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
       );
 
       const messageId = Number(result.lastInsertRowid);
@@ -535,14 +623,15 @@ export class ConversationStore {
     role: MessageRole,
     content: string,
   ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
     const row = this.db
       .prepare(
         `SELECT 1 AS count
        FROM messages
-       WHERE conversation_id = ? AND role = ? AND content = ?
+       WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND content = ?
        LIMIT 1`,
       )
-      .get(conversationId, role, content) as unknown as CountRow | undefined;
+      .get(conversationId, identityHash, role, content) as unknown as CountRow | undefined;
 
     return row?.count === 1;
   }
@@ -552,13 +641,14 @@ export class ConversationStore {
     role: MessageRole,
     content: string,
   ): Promise<number> {
+    const identityHash = buildMessageIdentityHash(role, content);
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS count
        FROM messages
-       WHERE conversation_id = ? AND role = ? AND content = ?`,
+       WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND content = ?`,
       )
-      .get(conversationId, role, content) as unknown as CountRow | undefined;
+      .get(conversationId, identityHash, role, content) as unknown as CountRow | undefined;
 
     return row?.count ?? 0;
   }
@@ -704,6 +794,7 @@ export class ConversationStore {
           input.query,
           limit,
           input.conversationId,
+          input.conversationIds,
           input.since,
           input.before,
         );
@@ -714,6 +805,7 @@ export class ConversationStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
             input.sort,
@@ -723,14 +815,29 @@ export class ConversationStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
           );
         }
       }
-      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
+      return this.searchLike(
+        input.query,
+        limit,
+        input.conversationId,
+        input.conversationIds,
+        input.since,
+        input.before,
+      );
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(
+      input.query,
+      limit,
+      input.conversationId,
+      input.conversationIds,
+      input.since,
+      input.before,
+    );
   }
 
   private indexMessageForFullText(messageId: MessageId, content: string): void {
@@ -765,16 +872,20 @@ export class ConversationStore {
     query: string,
     limit: number,
     conversationId?: ConversationId,
+    conversationIds?: ConversationId[],
     since?: Date,
     before?: Date,
     sort?: SearchSort,
   ): MessageSearchResult[] {
     const where: string[] = ["messages_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
-    if (conversationId != null) {
-      where.push("m.conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "m.conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(m.created_at) >= julianday(?)");
       args.push(since.toISOString());
@@ -806,6 +917,7 @@ export class ConversationStore {
     query: string,
     limit: number,
     conversationId?: ConversationId,
+    conversationIds?: ConversationId[],
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -816,10 +928,13 @@ export class ConversationStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");
       args.push(since.toISOString());
@@ -865,6 +980,7 @@ export class ConversationStore {
     pattern: string,
     limit: number,
     conversationId?: ConversationId,
+    conversationIds?: ConversationId[],
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -882,10 +998,13 @@ export class ConversationStore {
 
     const where: string[] = [];
     const args: Array<string | number> = [];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");
       args.push(since.toISOString());

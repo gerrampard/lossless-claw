@@ -1,4 +1,5 @@
-import type { ContextEngine } from "openclaw/plugin-sdk";
+import { createHash } from "node:crypto";
+import type { ContextEngine } from "./openclaw-bridge.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
   ConversationStore,
@@ -9,6 +10,72 @@ import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/sum
 import { estimateTokens } from "./estimate-tokens.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+type AssemblySegment = "evictable" | "freshTail";
+
+export interface AssemblyOverflowContributor {
+  /** Context item ordinal in the persisted conversation window. */
+  ordinal: number;
+  /** Estimated token cost for the emitted prompt item. */
+  tokens: number;
+  /** Whether this item survived budget selection. */
+  selected: boolean;
+  /** Raw message id when the contributor is a message. */
+  messageId?: number;
+  /** Raw message sequence when the contributor is a message. */
+  seq?: number;
+  /** Raw message role when the contributor is a message. */
+  role?: MessageRole | "toolResult";
+  /** Summary id when the contributor is a summary. */
+  summaryId?: string;
+  /** Summary kind when the contributor is a summary. */
+  summaryKind?: SummaryRecord["kind"];
+  /** Summary depth when the contributor is a summary. */
+  summaryDepth?: number;
+}
+
+export interface AssemblyDuplicateCluster {
+  /** Depersonalized duplicate key or content hash. */
+  key: string;
+  /** Number of context items in this duplicate cluster. */
+  count: number;
+  /** Sum of estimated tokens in the duplicate cluster. */
+  tokens: number;
+  /** Context item ordinals participating in the cluster. */
+  ordinals: number[];
+  /** Message sequence hints when available. */
+  seqs?: number[];
+  /** Duplicate source kind. */
+  kind: "message-ref" | "summary-ref" | "message-content";
+}
+
+export interface AssemblyOverflowDiagnostics {
+  /** Token budget used by this assembly pass. */
+  tokenBudget: number;
+  /** Estimated token total for all resolved context items before selection. */
+  totalContextTokens: number;
+  /** Estimated raw-message tokens before selection. */
+  rawMessageTokens: number;
+  /** Estimated summary tokens before selection. */
+  summaryTokens: number;
+  /** Number of resolved raw messages before selection. */
+  rawMessageCount: number;
+  /** Number of resolved summaries before selection. */
+  summaryCount: number;
+  /** Number of resolved context items before selection. */
+  totalContextItems: number;
+  /** Raw messages selected for the assembled prompt. */
+  selectedRawMessageCount: number;
+  /** Summaries selected for the assembled prompt. */
+  selectedSummaryCount: number;
+  /** Duplicate context-reference clusters found before selection. */
+  duplicateRefClusters: AssemblyDuplicateCluster[];
+  /** Duplicate raw message-content clusters found before selection. */
+  duplicateMessageClusters: AssemblyDuplicateCluster[];
+  /** Largest raw-message token contributors. */
+  topMessageContributors: AssemblyOverflowContributor[];
+  /** Largest summary token contributors. */
+  topSummaryContributors: AssemblyOverflowContributor[];
+}
 
 const TOOL_CALL_TYPES = new Set([
   "toolCall",
@@ -19,6 +86,43 @@ const TOOL_CALL_TYPES = new Set([
   "function_call",
 ]);
 
+/** Block types that represent model-internal reasoning and will be stripped
+ *  by the provider layer before sending to the API. If an assistant message
+ *  contains *only* these block types, it should be treated as empty. */
+const THINKING_LIKE_TYPES = new Set(["thinking", "redacted_thinking", "reasoning"]);
+
+/** Returns true when every block in the content array is a thinking/reasoning
+ *  block that will be stripped downstream, leaving the message with an empty
+ *  content array (which Bedrock and other providers reject). */
+function isThinkingOnlyContent(content: unknown[]): boolean {
+  if (content.length === 0) return false;
+  return content.every(
+    (block) =>
+      !!block &&
+      typeof block === "object" &&
+      THINKING_LIKE_TYPES.has((block as Record<string, unknown>).type as string),
+  );
+}
+
+/** Returns true when a content block is a blank or whitespace-only text block. */
+function isBlankTextBlock(block: unknown): boolean {
+  if (!block || typeof block !== "object") return false;
+  const record = block as Record<string, unknown>;
+  if (record.type !== "text") return false;
+  if (typeof record.text !== "string") return false;
+  return record.text.trim() === "";
+}
+
+/** Returns true when every block in the content array is a text block whose
+ *  text is empty or whitespace-only. Bedrock rejects messages whose content
+ *  is a `[{type:"text", text:""}]` shape with `The text field in the
+ *  ContentBlock object at messages.N.content.0 is blank`, so they must be
+ *  filtered before the cleaned tail is handed to the provider. */
+function isBlankContent(content: unknown[]): boolean {
+  if (content.length === 0) return false;
+  return content.every(isBlankTextBlock);
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface AssembleContextInput {
@@ -26,8 +130,14 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
+  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  freshTailMaxTokens?: number;
   /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
+  /** When false, evictable items are always retained chronologically even if a searchable prompt is present. */
+  promptAwareEviction?: boolean;
+  /** Optional stable boundary for orphan tool-call stripping during hot-cache epochs. */
+  orphanStrippingOrdinal?: number;
 }
 
 export interface AssembleContextResult {
@@ -35,88 +145,37 @@ export interface AssembleContextResult {
   messages: AgentMessage[];
   /** Total estimated tokens */
   estimatedTokens: number;
-  /** Optional dynamic system prompt guidance derived from DAG state */
-  systemPromptAddition?: string;
   /** Stats about what was assembled */
   stats: {
     rawMessageCount: number;
     summaryCount: number;
     totalContextItems: number;
   };
+  /** Optional local diagnostics for cache-stability debugging. */
+  debug?: {
+    freshTailOrdinal: number;
+    orphanStrippingOrdinal: number;
+    baseFreshTailCount: number;
+    freshTailCount: number;
+    tailTokens: number;
+    remainingBudget: number;
+    evictableTotalTokens: number;
+    selectionMode: "full-fit" | "prompt-aware" | "chronological";
+    promotedToolResultCount: number;
+    promotedOrdinals: number[];
+    removedToolUseBlockCount: number;
+    touchedAssistantMessageCount: number;
+    preSanitizeEvictableCount: number;
+    preSanitizeFreshTailCount: number;
+    preSanitizeEvictableHash: string;
+    preSanitizeFreshTailHash: string;
+    preSanitizeMessagesHash: string;
+    finalMessagesHash: string;
+    overflowDiagnostics: AssemblyOverflowDiagnostics;
+  };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-type SummaryPromptSignal = Pick<SummaryRecord, "kind" | "depth" | "descendantCount">;
-
-/**
- * Build dynamic prompt guidance for compacted session context.
- *
- * Guidance is emitted only when summaries are present in assembled context.
- * Static recall policy lives in the plugin prompt hook so this addition
- * remains session-specific and reflects only the current compaction state.
- */
-function buildSystemPromptAddition(summarySignals: SummaryPromptSignal[]): string | undefined {
-  if (summarySignals.length === 0) {
-    return undefined;
-  }
-
-  const maxDepth = summarySignals.reduce((deepest, signal) => Math.max(deepest, signal.depth), 0);
-  const condensedCount = summarySignals.filter((signal) => signal.kind === "condensed").length;
-  const heavilyCompacted = maxDepth >= 2 || condensedCount >= 2;
-
-  const sections: string[] = [];
-
-  // Dynamic compaction reminder — always present when summaries exist.
-  sections.push(
-    "## Compacted Conversation Context",
-    "",
-    "Summaries above are compressed context, not full detail.",
-    "",
-    "Treat summaries as compressed recall cues rather than proof of exact wording or exact values.",
-    "",
-    "If a summary includes an \"Expand for details about:\" footer, use it as a cue to expand before asserting specifics.",
-  );
-
-  // Precision/evidence rules — always present but stronger when heavily compacted.
-  if (heavilyCompacted) {
-    sections.push(
-      "",
-      "**Deeply compacted context: expand before asserting specifics.**",
-      "",
-      "Before answering with exact commands, SHAs, paths, timestamps, config values, or causal chains, expand for the missing detail.",
-      "",
-      "Default recall flow for precision work:",
-      "1) `lcm_grep` to locate relevant summary/message IDs",
-      "2) `lcm_expand_query` with a focused prompt",
-      "3) Answer directly from the retrieved evidence",
-      "",
-      "Keep raw summary IDs in tool context for follow-up; do not include them in the user-facing answer unless the user asks for sources or IDs.",
-      "",
-      "`lcm_grep` tips: prefer `mode: \"full_text\"` for keyword/topic lookup, quote exact multi-word phrases, use `sort: \"relevance\"` for older-topic retrieval, and use `sort: \"hybrid\"` when recency should still influence ranking.",
-      "`lcm_expand_query(query: ...)` uses the same FTS5 full-text search rules as `lcm_grep`: terms are ANDed by default, so extra query words narrow results. Keep `query` to 1-3 distinctive terms or a quoted phrase, and put the natural-language question in `prompt`.",
-      "",
-      "**Uncertainty checklist (run before answering):**",
-      "- Am I making an exact factual claim from a compressed or condensed summary?",
-      "- Could compaction have omitted a crucial detail?",
-      "- Would I need an expansion step if the user asks for proof or the exact text?",
-      "- Should I state uncertainty instead of asserting specifics until I expand?",
-      "",
-      "If yes to any item, expand first or explicitly say that you need to expand.",
-      "",
-      "Do not guess exact commands, SHAs, file paths, timestamps, config values, or causal claims from condensed summaries. Expand first or explicitly say that you need to expand.",
-    );
-  } else {
-    sections.push(
-      "",
-      "For exact commands, SHAs, paths, timestamps, config values, or causal chains, expand for details before answering.",
-      "State uncertainty instead of guessing from compressed summaries.",
-    );
-  }
-
-  return sections.join("\n");
-}
 
 /**
  * Map a DB message role to an AgentMessage role.
@@ -625,94 +684,41 @@ function extractToolResultIdFromMessage(message: AgentMessage): string | null {
   return null;
 }
 
-function collectAssistantToolCallIds(items: ResolvedItem[]): Set<string> {
-  const ids = new Set<string>();
-  for (const item of items) {
-    for (const id of extractToolCallIdsFromAssistant(item.message)) {
-      ids.add(id);
-    }
-  }
-  return ids;
-}
-
-function mergeFreshTailWithMatchingToolResults(
-  freshTail: ResolvedItem[],
-  matchingToolResults: ResolvedItem[],
-): ResolvedItem[] {
-  if (matchingToolResults.length === 0) {
-    return freshTail;
-  }
-
-  const resultsById = new Map<string, ResolvedItem[]>();
-  for (const item of matchingToolResults) {
-    const toolResultId = extractToolResultIdFromMessage(item.message);
-    if (!toolResultId) {
-      continue;
-    }
-    const existing = resultsById.get(toolResultId);
-    if (existing) {
-      existing.push(item);
-    } else {
-      resultsById.set(toolResultId, [item]);
-    }
-  }
-
-  const merged: ResolvedItem[] = [];
-  const usedOrdinals = new Set<number>();
-
-  for (const item of freshTail) {
-    merged.push(item);
-
-    const toolCallIds = extractToolCallIdsFromAssistant(item.message);
-    if (toolCallIds.length === 0) {
-      continue;
-    }
-
-    for (const toolCallId of toolCallIds) {
-      const matches = resultsById.get(toolCallId);
-      if (!matches) {
-        continue;
-      }
-      for (const match of matches) {
-        if (usedOrdinals.has(match.ordinal)) {
-          continue;
-        }
-        merged.push(match);
-        usedOrdinals.add(match.ordinal);
-      }
-    }
-  }
-
-  for (const item of matchingToolResults) {
-    if (!usedOrdinals.has(item.ordinal)) {
-      merged.push(item);
-    }
-  }
-
-  return merged;
-}
-
 function filterNonFreshAssistantToolCalls(
   items: ResolvedItem[],
   freshTailOrdinals: Set<number>,
-): AgentMessage[] {
-  const availableToolResultIds = new Set<string>();
+  orphanStrippingOrdinal: number,
+  allToolResultOrdinalsById: Map<string, number[]>,
+): {
+  entries: Array<{ message: AgentMessage; segment: AssemblySegment }>;
+  removedToolUseBlockCount: number;
+  touchedAssistantMessageCount: number;
+} {
+  const selectedToolResultOrdinalsById = new Map<string, number[]>();
   for (const item of items) {
     const toolResultId = extractToolResultIdFromMessage(item.message);
     if (toolResultId) {
-      availableToolResultIds.add(toolResultId);
+      const ordinals = selectedToolResultOrdinalsById.get(toolResultId);
+      if (ordinals) {
+        ordinals.push(item.ordinal);
+      } else {
+        selectedToolResultOrdinalsById.set(toolResultId, [item.ordinal]);
+      }
     }
   }
 
-  const filteredMessages: AgentMessage[] = [];
+  const filteredEntries: Array<{ message: AgentMessage; segment: AssemblySegment }> = [];
+  let removedToolUseBlockCount = 0;
+  let touchedAssistantMessageCount = 0;
   for (const item of items) {
-    if (item.message?.role !== "assistant" || freshTailOrdinals.has(item.ordinal)) {
-      filteredMessages.push(item.message);
+    const segment: AssemblySegment = freshTailOrdinals.has(item.ordinal) ? "freshTail" : "evictable";
+    if (item.message?.role !== "assistant") {
+      filteredEntries.push({ message: item.message, segment });
       continue;
     }
 
     if (!Array.isArray(item.message.content)) {
-      filteredMessages.push(item.message);
+      filteredEntries.push({ message: item.message, segment });
       continue;
     }
 
@@ -726,7 +732,19 @@ function filterNonFreshAssistantToolCalls(
         return true;
       }
       const toolCallId = extractToolCallId(record);
-      if (!toolCallId || availableToolResultIds.has(toolCallId)) {
+      if (!toolCallId) {
+        return true;
+      }
+      const selectedOrdinals = selectedToolResultOrdinalsById.get(toolCallId) ?? [];
+      const hasUsableSelectedResult = selectedOrdinals.some((ordinal) => ordinal > item.ordinal);
+      if (hasUsableSelectedResult) {
+        return true;
+      }
+      if (item.ordinal < orphanStrippingOrdinal) {
+        removedAny = true;
+        return false;
+      }
+      if (!(allToolResultOrdinalsById.get(toolCallId)?.length)) {
         return true;
       }
       removedAny = true;
@@ -734,18 +752,37 @@ function filterNonFreshAssistantToolCalls(
     });
 
     if (content.length === 0) {
+      removedToolUseBlockCount++;
+      touchedAssistantMessageCount++;
       continue;
     }
     if (!removedAny) {
-      filteredMessages.push(item.message);
+      filteredEntries.push({ message: item.message, segment });
       continue;
     }
-    filteredMessages.push({
-      ...item.message,
-      content: content as typeof item.message.content,
-    } as AgentMessage);
+    removedToolUseBlockCount++;
+    touchedAssistantMessageCount++;
+    filteredEntries.push({
+      message: {
+        ...item.message,
+        content: content as typeof item.message.content,
+      } as AgentMessage,
+      segment,
+    });
   }
-  return filteredMessages;
+  return {
+    entries: filteredEntries,
+    removedToolUseBlockCount,
+    touchedAssistantMessageCount,
+  };
+}
+
+function hashMessages(messages: AgentMessage[]): string {
+  return createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 16);
+}
+
+function hashText(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
 /** Format a Date for XML attributes in the agent's timezone. */
@@ -827,8 +864,171 @@ interface ResolvedItem {
   isMessage: boolean;
   /** Pre-extracted plain text used for relevance scoring */
   text: string;
-  /** Summary metadata used for dynamic system prompt guidance */
-  summarySignal?: SummaryPromptSignal;
+  /** Source raw message id when this item resolves a message. */
+  messageId?: number;
+  /** Source raw message sequence when this item resolves a message. */
+  seq?: number;
+  /** Source raw message role when this item resolves a message. */
+  sourceRole?: MessageRole;
+  /** Source summary record when this item resolves a summary. */
+  summary?: SummaryRecord;
+}
+
+function topContributors(
+  items: ResolvedItem[],
+  selectedOrdinals: Set<number>,
+  isMessage: boolean,
+): AssemblyOverflowContributor[] {
+  return items
+    .filter((item) => item.isMessage === isMessage)
+    .slice()
+    .sort((a, b) => b.tokens - a.tokens || a.ordinal - b.ordinal)
+    .slice(0, 5)
+    .map((item) => ({
+      ordinal: item.ordinal,
+      tokens: item.tokens,
+      selected: selectedOrdinals.has(item.ordinal),
+      ...(item.messageId != null ? { messageId: item.messageId } : {}),
+      ...(item.seq != null ? { seq: item.seq } : {}),
+      ...(item.sourceRole ? { role: item.sourceRole } : {}),
+      ...(item.summary
+        ? {
+            summaryId: item.summary.summaryId,
+            summaryKind: item.summary.kind,
+            summaryDepth: item.summary.depth,
+          }
+        : {}),
+    }));
+}
+
+function buildRefDuplicateClusters(items: ResolvedItem[]): AssemblyDuplicateCluster[] {
+  const clusters = new Map<string, ResolvedItem[]>();
+  for (const item of items) {
+    const key = item.isMessage
+      ? item.messageId == null ? null : `message:${item.messageId}`
+      : item.summary == null ? null : `summary:${item.summary.summaryId}`;
+    if (!key) {
+      continue;
+    }
+    const existing = clusters.get(key) ?? [];
+    existing.push(item);
+    clusters.set(key, existing);
+  }
+  return formatDuplicateClusters(clusters, (key) =>
+    key.startsWith("message:") ? "message-ref" : "summary-ref",
+  );
+}
+
+function buildMessageContentDuplicateClusters(items: ResolvedItem[]): AssemblyDuplicateCluster[] {
+  const clusters = new Map<string, ResolvedItem[]>();
+  for (const item of items) {
+    if (!item.isMessage || item.text.length === 0) {
+      continue;
+    }
+    const hash = hashText(item.text);
+    const existing = clusters.get(hash) ?? [];
+    existing.push(item);
+    clusters.set(hash, existing);
+  }
+  return formatDuplicateClusters(clusters, () => "message-content");
+}
+
+function formatDuplicateClusters(
+  clusters: Map<string, ResolvedItem[]>,
+  kindForKey: (key: string) => AssemblyDuplicateCluster["kind"],
+): AssemblyDuplicateCluster[] {
+  return [...clusters.entries()]
+    .filter(([, items]) => items.length > 1)
+    .map(([key, items]) => ({
+      key,
+      kind: kindForKey(key),
+      count: items.length,
+      tokens: items.reduce((sum, item) => sum + item.tokens, 0),
+      ordinals: items.map((item) => item.ordinal).slice(0, 8),
+      ...(items.some((item) => item.seq != null)
+        ? { seqs: items.flatMap((item) => item.seq == null ? [] : [item.seq]).slice(0, 8) }
+        : {}),
+    }))
+    .sort((a, b) => b.tokens - a.tokens || b.count - a.count || a.key.localeCompare(b.key))
+    .slice(0, 5);
+}
+
+function buildOverflowDiagnostics(
+  params: {
+    resolved: ResolvedItem[];
+    selected: ResolvedItem[];
+    tokenBudget: number;
+  },
+): AssemblyOverflowDiagnostics {
+  const selectedOrdinals = new Set(params.selected.map((item) => item.ordinal));
+  const rawMessageItems = params.resolved.filter((item) => item.isMessage);
+  const summaryItems = params.resolved.filter((item) => !item.isMessage);
+  return {
+    tokenBudget: params.tokenBudget,
+    totalContextTokens: params.resolved.reduce((sum, item) => sum + item.tokens, 0),
+    rawMessageTokens: rawMessageItems.reduce((sum, item) => sum + item.tokens, 0),
+    summaryTokens: summaryItems.reduce((sum, item) => sum + item.tokens, 0),
+    rawMessageCount: rawMessageItems.length,
+    summaryCount: summaryItems.length,
+    totalContextItems: params.resolved.length,
+    selectedRawMessageCount: params.selected.filter((item) => item.isMessage).length,
+    selectedSummaryCount: params.selected.filter((item) => !item.isMessage).length,
+    duplicateRefClusters: buildRefDuplicateClusters(params.resolved),
+    duplicateMessageClusters: buildMessageContentDuplicateClusters(params.resolved),
+    topMessageContributors: topContributors(params.resolved, selectedOrdinals, true),
+    topSummaryContributors: topContributors(params.resolved, selectedOrdinals, false),
+  };
+}
+
+function resolveFreshTailOrdinal(
+  resolved: ResolvedItem[],
+  freshTailCount: number,
+  freshTailMaxTokens?: number,
+): number {
+  if (!Number.isFinite(freshTailCount) || freshTailCount <= 0) {
+    return Infinity;
+  }
+
+  const rawMessages = resolved.filter((item) => item.isMessage);
+  if (rawMessages.length === 0) {
+    return Infinity;
+  }
+
+  const tokenCap =
+    typeof freshTailMaxTokens === "number" &&
+    Number.isFinite(freshTailMaxTokens) &&
+    freshTailMaxTokens >= 0
+      ? Math.floor(freshTailMaxTokens)
+      : undefined;
+
+  let protectedCount = 0;
+  let protectedTokens = 0;
+  let tailStartOrdinal = Infinity;
+
+  for (let idx = rawMessages.length - 1; idx >= 0; idx--) {
+    if (protectedCount >= freshTailCount) {
+      break;
+    }
+
+    const item = rawMessages[idx];
+    if (!item) {
+      continue;
+    }
+
+    const wouldExceedBudget =
+      protectedCount > 0 &&
+      typeof tokenCap === "number" &&
+      protectedTokens + item.tokens > tokenCap;
+    if (wouldExceedBudget) {
+      break;
+    }
+
+    tailStartOrdinal = item.ordinal;
+    protectedCount++;
+    protectedTokens += item.tokens;
+  }
+
+  return tailStartOrdinal;
 }
 
 // ── BM25-lite relevance scorer ────────────────────────────────────────────────
@@ -894,7 +1094,8 @@ export class ContextAssembler {
    * 1. Fetch all context items for the conversation (ordered by ordinal).
    * 2. Resolve each item into an AgentMessage (fetching the underlying
    *    message or summary record).
-   * 3. Protect the "fresh tail" (last N items) from truncation.
+   * 3. Protect the "fresh tail" (last N raw messages, optionally token-capped)
+   *    from truncation.
    * 4. If over budget, drop oldest non-fresh items until we fit.
    * 5. Return the final ordered messages in chronological order.
    */
@@ -919,33 +1120,42 @@ export class ContextAssembler {
     // Count stats from the full (pre-truncation) set
     let rawMessageCount = 0;
     let summaryCount = 0;
-    const summarySignals: SummaryPromptSignal[] = [];
     for (const item of resolved) {
       if (item.isMessage) {
         rawMessageCount++;
       } else {
         summaryCount++;
-        if (item.summarySignal) {
-          summarySignals.push(item.summarySignal);
-        }
       }
     }
 
-    const systemPromptAddition = buildSystemPromptAddition(summarySignals);
-
     // Step 3: Split into evictable prefix and protected fresh tail
-    const tailStart = Math.max(0, resolved.length - freshTailCount);
-    const baseFreshTail = resolved.slice(tailStart);
-    const initialEvictable = resolved.slice(0, tailStart);
-    const freshTailOrdinals = new Set(baseFreshTail.map((item) => item.ordinal));
-    const tailToolCallIds = collectAssistantToolCallIds(baseFreshTail);
-    const tailPairToolResults = initialEvictable.filter((item) => {
+    const freshTailOrdinal = resolveFreshTailOrdinal(
+      resolved,
+      freshTailCount,
+      input.freshTailMaxTokens,
+    );
+    const orphanStrippingOrdinal =
+      typeof input.orphanStrippingOrdinal === "number"
+      && Number.isFinite(input.orphanStrippingOrdinal)
+      && input.orphanStrippingOrdinal >= 0
+        ? Math.floor(input.orphanStrippingOrdinal)
+        : freshTailOrdinal;
+    const allToolResultOrdinalsById = new Map<string, number[]>();
+    for (const item of resolved) {
       const toolResultId = extractToolResultIdFromMessage(item.message);
-      return toolResultId !== null && tailToolCallIds.has(toolResultId);
-    });
-    const protectedEvictableOrdinals = new Set(tailPairToolResults.map((item) => item.ordinal));
-    const evictable = initialEvictable.filter((item) => !protectedEvictableOrdinals.has(item.ordinal));
-    const freshTail = mergeFreshTailWithMatchingToolResults(baseFreshTail, tailPairToolResults);
+      if (!toolResultId) {
+        continue;
+      }
+      const ordinals = allToolResultOrdinalsById.get(toolResultId);
+      if (ordinals) {
+        ordinals.push(item.ordinal);
+      } else {
+        allToolResultOrdinalsById.set(toolResultId, [item.ordinal]);
+      }
+    }
+    const baseFreshTail = resolved.filter((item) => item.ordinal >= freshTailOrdinal);
+    const evictable = resolved.filter((item) => item.ordinal < freshTailOrdinal);
+    const freshTail = baseFreshTail;
 
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
@@ -967,11 +1177,13 @@ export class ContextAssembler {
     // total, then trim from the front.
     const evictableTotalTokens = evictable.reduce((sum, it) => sum + it.tokens, 0);
 
+    let selectionMode: "full-fit" | "prompt-aware" | "chronological" = "full-fit";
     if (evictableTotalTokens <= remainingBudget) {
       // Everything fits
       selected.push(...evictable);
       evictableTokens = evictableTotalTokens;
-    } else if (hasSearchablePrompt(input.prompt)) {
+    } else if (input.promptAwareEviction !== false && hasSearchablePrompt(input.prompt)) {
+      selectionMode = "prompt-aware";
       // Prompt-aware eviction: score each evictable item by relevance to the
       // prompt, then greedily fill budget from highest-scoring items down.
       // Re-sort selected items by ordinal to restore chronological order.
@@ -996,6 +1208,7 @@ export class ContextAssembler {
       selected.push(...kept);
       evictableTokens = accum;
     } else {
+      selectionMode = "chronological";
       // Chronological eviction (default): drop oldest items until we fit.
       // Walk from the END of evictable (newest first) accumulating tokens,
       // then reverse to restore chronological order.
@@ -1020,39 +1233,100 @@ export class ContextAssembler {
     selected.push(...freshTail);
 
     const estimatedTokens = evictableTokens + tailTokens;
+    const overflowDiagnostics = buildOverflowDiagnostics({
+      resolved,
+      selected,
+      tokenBudget,
+    });
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
-    const rawMessages = filterNonFreshAssistantToolCalls(selected, freshTailOrdinals);
-    for (let i = 0; i < rawMessages.length; i++) {
-      const msg = rawMessages[i];
+    const filteredToolCalls = filterNonFreshAssistantToolCalls(
+      selected,
+      new Set(freshTail.map((item) => item.ordinal)),
+      orphanStrippingOrdinal,
+      allToolResultOrdinalsById,
+    );
+    const normalizedEntries = filteredToolCalls.entries.map((entry) => {
+      const msg = entry.message;
       if (msg?.role === "assistant" && typeof msg.content === "string") {
-        rawMessages[i] = {
-          ...msg,
-          content: [{ type: "text", text: msg.content }] as unknown as typeof msg.content,
-        } as typeof msg;
+        return {
+          ...entry,
+          message: {
+            ...msg,
+            content: [{ type: "text", text: msg.content }] as unknown as typeof msg.content,
+          } as AgentMessage,
+        };
       }
-    }
+      if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+        const content = msg.content.filter((block) => !isBlankTextBlock(block));
+        if (content.length !== msg.content.length) {
+          return {
+            ...entry,
+            message: {
+              ...msg,
+              content: content as unknown as typeof msg.content,
+            } as AgentMessage,
+          };
+        }
+      }
+      return entry;
+    });
 
-    // Filter out assistant messages with empty content — these can occur when
-    // tool-use-only turns are stored with content="" and zero message_parts,
-    // or when filterNonFreshAssistantToolCalls strips all tool_use blocks.
-    // Anthropic (and other providers) reject empty content arrays/strings.
-    const cleaned = rawMessages.filter(
-      (m) =>
+    // Filter out assistant messages with empty, blank, or thinking-only
+    // content — these can occur when tool-use-only turns are stored with
+    // content="" and zero message_parts, when filterNonFreshAssistantToolCalls
+    // strips all tool_use blocks, when a turn contains only thinking/reasoning
+    // blocks that will be stripped by the provider layer, or when the stored
+    // content is a `[{type:"text", text:""}]` blank-text shape. Anthropic and
+    // Bedrock reject any of these as empty.
+    const cleanedEntries = normalizedEntries.filter(
+      (entry) =>
         !(
-          m?.role === "assistant" &&
-          (Array.isArray(m.content) ? m.content.length === 0 : !m.content)
+          entry.message?.role === "assistant" &&
+          (Array.isArray(entry.message.content)
+            ? entry.message.content.length === 0 ||
+              isThinkingOnlyContent(entry.message.content) ||
+              isBlankContent(entry.message.content)
+            : !entry.message.content || entry.message.content.trim() === "")
         ),
     );
+    const cleaned = cleanedEntries.map((entry) => entry.message);
+    const preSanitizeEvictableMessages = cleanedEntries
+      .filter((entry) => entry.segment === "evictable")
+      .map((entry) => entry.message);
+    const preSanitizeFreshTailMessages = cleanedEntries
+      .filter((entry) => entry.segment === "freshTail")
+      .map((entry) => entry.message);
+    const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
     return {
-      messages: sanitizeToolUseResultPairing(cleaned) as AgentMessage[],
+      messages: repaired,
       estimatedTokens,
-      systemPromptAddition,
       stats: {
         rawMessageCount,
         summaryCount,
         totalContextItems: resolved.length,
+      },
+      debug: {
+        freshTailOrdinal,
+        orphanStrippingOrdinal,
+        baseFreshTailCount: baseFreshTail.length,
+        freshTailCount: freshTail.length,
+        tailTokens,
+        remainingBudget,
+        evictableTotalTokens,
+        selectionMode,
+        promotedToolResultCount: 0,
+        promotedOrdinals: [],
+        removedToolUseBlockCount: filteredToolCalls.removedToolUseBlockCount,
+        touchedAssistantMessageCount: filteredToolCalls.touchedAssistantMessageCount,
+        preSanitizeEvictableCount: preSanitizeEvictableMessages.length,
+        preSanitizeFreshTailCount: preSanitizeFreshTailMessages.length,
+        preSanitizeEvictableHash: hashMessages(preSanitizeEvictableMessages),
+        preSanitizeFreshTailHash: hashMessages(preSanitizeFreshTailMessages),
+        preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
+        finalMessagesHash: hashMessages(repaired),
+        overflowDiagnostics,
       },
     };
   }
@@ -1111,7 +1385,7 @@ export class ContextAssembler {
     // content text AND the message_parts table are empty — assistant
     // messages that contain tool calls have empty text content but
     // non-empty parts and must be preserved.
-    if (msg.role === "assistant" && !msg.content.trim() && parts.length === 0) {
+    if (msg.role === "assistant" && !(typeof msg.content === "string" ? msg.content.trim() : "") && parts.length === 0) {
       return null;
     }
     const roleFromStore = toRuntimeRole(msg.role, parts);
@@ -1163,6 +1437,9 @@ export class ContextAssembler {
       tokens: tokenCount,
       isMessage: true,
       text: contentText,
+      messageId: msg.messageId,
+      seq: msg.seq,
+      sourceRole: msg.role,
     };
   }
 
@@ -1186,11 +1463,7 @@ export class ContextAssembler {
       tokens,
       isMessage: false,
       text: summary.content,
-      summarySignal: {
-        kind: summary.kind,
-        depth: summary.depth,
-        descendantCount: summary.descendantCount,
-      },
+      summary,
     };
   }
 }

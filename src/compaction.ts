@@ -36,6 +36,8 @@ export interface CompactionConfig {
   contextThreshold: number;
   /** Number of fresh tail turns to protect (default 8) */
   freshTailCount: number;
+  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  freshTailMaxTokens?: number;
   /** Minimum number of depth-0 summaries needed for condensation. */
   leafMinFanout: number;
   /** Minimum number of depth>=1 summaries needed for condensation. */
@@ -186,6 +188,7 @@ const MEDIA_PATH_RE = /^MEDIA:\/.+$/;
 const EMBEDDED_DATA_URL_RE = /data:[^;\s"'`]+;base64,[A-Za-z0-9+/=\s]+/gi;
 const MEDIA_ATTACHMENT_PART_TYPES = new Set(["file", "snapshot"]);
 const MEDIA_ATTACHMENT_RAW_TYPES = new Set(["file", "image", "snapshot"]);
+const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking"]);
 const STRUCTURED_MEDIA_TEXT_KEYS = ["text", "caption", "alt", "title", "summary"] as const;
 const STRUCTURED_MEDIA_NESTED_KEYS = ["content", "parts", "items", "message", "messages"] as const;
 
@@ -220,6 +223,7 @@ function parseMessagePartMetadata(part: CreateMessagePartInput | { metadata: str
 
 /** Detect whether a string is mostly binary/base64 payload and not meaningful prose. */
 function looksLikeBinaryPayload(value: string): boolean {
+  if (typeof value !== "string") return false;
   const trimmed = value.trim();
   if (!trimmed) {
     return false;
@@ -239,6 +243,7 @@ function looksLikeBinaryPayload(value: string): boolean {
 
 /** Strip attachment payloads from plain strings before they reach the summarizer. */
 function stripEmbeddedMediaPayloads(content: string): string {
+  if (typeof content !== "string") return "";
   const withoutDataUrls = content.replace(EMBEDDED_DATA_URL_RE, "[embedded media omitted]");
   const sanitizedLines = withoutDataUrls
     .split(/\r?\n/)
@@ -277,6 +282,9 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
 
   const record = value as Record<string, unknown>;
   const rawType = typeof record.type === "string" ? record.type.trim().toLowerCase() : "";
+  if (PROVIDER_REASONING_RAW_TYPES.has(rawType)) {
+    return [];
+  }
   const textFragments: string[] = [];
 
   for (const key of STRUCTURED_MEDIA_TEXT_KEYS) {
@@ -303,6 +311,7 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
 
 /** Normalize message content down to human-readable text, excluding binary/media payloads. */
 function extractMeaningfulMessageText(content: string): string {
+  if (typeof content !== "string") return "";
   const trimmed = content.trim();
   if (!trimmed) {
     return "";
@@ -890,16 +899,29 @@ export class CompactionEngine {
     return 0;
   }
 
+  /** Normalize configured fresh tail token cap to a safe non-negative integer. */
+  private resolveFreshTailMaxTokens(): number | undefined {
+    if (
+      typeof this.config.freshTailMaxTokens === "number" &&
+      Number.isFinite(this.config.freshTailMaxTokens) &&
+      this.config.freshTailMaxTokens >= 0
+    ) {
+      return Math.floor(this.config.freshTailMaxTokens);
+    }
+    return undefined;
+  }
+
   /**
    * Compute the ordinal boundary for protected fresh messages.
    *
    * Messages with ordinal >= returned value are preserved as fresh tail.
    */
-  private resolveFreshTailOrdinal(contextItems: ContextItemRecord[]): number {
+  private async resolveFreshTailOrdinal(contextItems: ContextItemRecord[]): Promise<number> {
     const freshTailCount = this.resolveFreshTailCount();
     if (freshTailCount <= 0) {
       return Infinity;
     }
+    const freshTailMaxTokens = this.resolveFreshTailMaxTokens();
 
     const rawMessageItems = contextItems.filter(
       (item) => item.itemType === "message" && item.messageId != null,
@@ -908,8 +930,35 @@ export class CompactionEngine {
       return Infinity;
     }
 
-    const tailStartIdx = Math.max(0, rawMessageItems.length - freshTailCount);
-    return rawMessageItems[tailStartIdx]?.ordinal ?? Infinity;
+    let protectedCount = 0;
+    let protectedTokens = 0;
+    let tailStartOrdinal = Infinity;
+
+    for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
+      if (protectedCount >= freshTailCount) {
+        break;
+      }
+
+      const item = rawMessageItems[idx];
+      if (!item || item.messageId == null) {
+        continue;
+      }
+
+      const messageTokens = await this.getMessageTokenCount(item.messageId);
+      const wouldExceedBudget =
+        protectedCount > 0 &&
+        typeof freshTailMaxTokens === "number" &&
+        protectedTokens + messageTokens > freshTailMaxTokens;
+      if (wouldExceedBudget) {
+        break;
+      }
+
+      tailStartOrdinal = item.ordinal;
+      protectedCount++;
+      protectedTokens += messageTokens;
+    }
+
+    return tailStartOrdinal;
   }
 
   /** Resolve message token count with a content-length fallback. */
@@ -931,7 +980,7 @@ export class CompactionEngine {
   /** Sum raw message tokens outside the protected fresh tail. */
   private async countRawTokensOutsideFreshTail(conversationId: number): Promise<number> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     let rawTokens = 0;
 
     for (const item of contextItems) {
@@ -958,7 +1007,7 @@ export class CompactionEngine {
     leafChunkTokensOverride?: number,
   ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
 
     let rawTokensOutsideTail = 0;
@@ -1041,7 +1090,7 @@ export class CompactionEngine {
         continue;
       }
       const summary = await this.summaryStore.getSummary(item.summaryId);
-      const content = summary?.content.trim();
+      const content = typeof summary?.content === "string" ? summary.content.trim() : "";
       if (content) {
         summaryContents.push(content);
       }
@@ -1147,7 +1196,7 @@ export class CompactionEngine {
   }): Promise<CondensedPhaseCandidate | null> {
     const { conversationId, hardTrigger } = params;
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     const minChunkTokens = this.resolveCondensedMinChunkTokens();
     const depthLevels = await this.summaryStore.getDistinctDepthsInContext(conversationId, {
       maxOrdinalExclusive: freshTailOrdinal,
@@ -1187,7 +1236,7 @@ export class CompactionEngine {
     const freshTailOrdinal =
       typeof freshTailOrdinalOverride === "number"
         ? freshTailOrdinalOverride
-        : this.resolveFreshTailOrdinal(contextItems);
+        : await this.resolveFreshTailOrdinal(contextItems);
     const chunkTokenBudget = this.resolveLeafChunkTokens();
 
     const chunk: ContextItemRecord[] = [];
@@ -1263,7 +1312,7 @@ export class CompactionEngine {
       if (!summary || summary.depth !== targetDepth) {
         continue;
       }
-      const content = summary.content.trim();
+      const content = typeof summary.content === "string" ? summary.content.trim() : "";
       if (content) {
         summaryContents.push(content);
       }
@@ -1289,7 +1338,7 @@ export class CompactionEngine {
     /** Target token count for this summary kind (leaf or condensed). Used for hard-cap enforcement. */
     targetTokens: number;
   }): Promise<{ content: string; level: CompactionLevel } | null> {
-    const sourceText = params.sourceText.trim();
+    const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
       return {
         content: "[Truncated from 0 tokens]",
@@ -1449,7 +1498,15 @@ export class CompactionEngine {
     }
 
     const concatenated = messageContents
-      .map((message) => `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${message.content}`)
+      .map((message) => {
+        // Strip provider reasoning/thinking blocks (e.g. {type:"thinking",thinkingSignature:"..."})
+        // so encrypted signatures and non-visible metadata don't pollute the summary.
+        // The raw message content is preserved in the DB for conversation history and prompt caching.
+        const text = extractMeaningfulMessageText(message.content);
+        if (!text) return null;
+        return `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${text}`;
+      })
+      .filter((s): s is string => s !== null)
       .join("\n\n");
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),

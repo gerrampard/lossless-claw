@@ -799,6 +799,90 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(summaryMsg!.content).toContain("This is a leaf summary");
   });
 
+  it("emits depersonalized overflow diagnostics with top contributors", async () => {
+    const [small, large, duplicate] = await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => {
+        if (i === 0) return "tiny";
+        if (i === 1) return `large message ${"x".repeat(800)}`;
+        return `repeated content ${"y".repeat(120)}`;
+      },
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+    const duplicateText = duplicate.content;
+    const secondDuplicate = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 4,
+      role: "assistant",
+      content: duplicateText,
+      tokenCount: estimateTokens(duplicateText),
+    });
+    await sumStore.appendContextMessage(CONV_ID, secondDuplicate.messageId);
+
+    const summaryId = "sum_overflow_diag";
+    await sumStore.insertSummary({
+      summaryId,
+      conversationId: CONV_ID,
+      kind: "leaf",
+      content: `summary contributor ${"z".repeat(500)}`,
+      tokenCount: 125,
+    });
+    await sumStore.appendContextSummary(CONV_ID, summaryId);
+    sumStore._contextItems.push({
+      conversationId: CONV_ID,
+      ordinal: 5,
+      itemType: "message",
+      messageId: large.messageId,
+      summaryId: null,
+      createdAt: new Date(),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 150,
+      freshTailCount: 1,
+    });
+
+    const diagnostics = result.debug?.overflowDiagnostics;
+    expect(diagnostics).toMatchObject({
+      tokenBudget: 150,
+      rawMessageCount: 5,
+      summaryCount: 1,
+      totalContextItems: 6,
+    });
+    expect(diagnostics?.rawMessageTokens).toBeGreaterThan(diagnostics?.summaryTokens ?? 0);
+    expect(diagnostics?.duplicateRefClusters).toEqual([
+      expect.objectContaining({
+        kind: "message-ref",
+        count: 2,
+        ordinals: [1, 5],
+        seqs: [2, 2],
+      }),
+    ]);
+    expect(diagnostics?.duplicateMessageClusters).toContainEqual(
+      expect.objectContaining({
+        kind: "message-content",
+        count: 2,
+        seqs: [2, 2],
+      }),
+    );
+    expect(diagnostics?.topMessageContributors[0]).toMatchObject({
+      messageId: large.messageId,
+      seq: 2,
+      role: "assistant",
+    });
+    expect(diagnostics?.topMessageContributors[0]?.tokens).toBeGreaterThanOrEqual(
+      diagnostics?.topMessageContributors[1]?.tokens ?? 0,
+    );
+    expect(diagnostics?.topSummaryContributors[0]).toMatchObject({
+      summaryId,
+      summaryKind: "leaf",
+      summaryDepth: 0,
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain("large message");
+    expect(JSON.stringify(diagnostics)).not.toContain("summary contributor");
+    expect(small.messageId).toBeGreaterThan(0);
+  });
+
   it("empty conversation returns empty result", async () => {
     const result = await assembler.assemble({
       conversationId: CONV_ID,
@@ -828,7 +912,41 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(result.messages).toHaveLength(3);
   });
 
-  it("pulls matching tool results into the protected tail when the tail contains their tool call", async () => {
+  it("fresh tail token cap drops older oversized tail messages from assembly", async () => {
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `M${i} ${"z".repeat(396)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 150,
+      freshTailCount: 4,
+      freshTailMaxTokens: 110,
+    });
+
+    expect(result.messages).toHaveLength(1);
+    expect(extractMessageText(result.messages[0]?.content)).toContain("M3");
+  });
+
+  it("fresh tail token cap still preserves the newest message when it alone exceeds the cap", async () => {
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => (i === 1 ? `Huge tail ${"q".repeat(796)}` : `Older ${"q".repeat(196)}`),
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 100,
+      freshTailCount: 2,
+      freshTailMaxTokens: 50,
+    });
+
+    const contents = result.messages.map((message) => extractMessageText(message.content));
+    expect(contents.some((text) => text.includes("Huge tail"))).toBe(true);
+  });
+
+  it("drops reverse-ordered tool-call blocks instead of promoting old tool results", async () => {
     await convStore.createConversation({ sessionId: "session-tail-tool-pair" });
 
     const toolResultMsg = await convStore.createMessage({
@@ -866,8 +984,18 @@ describe("LCM integration: ingest -> assemble", () => {
     await convStore.createMessageParts(assistantMsg.messageId, [
       {
         sessionId: "session-tail-tool-pair",
-        partType: "tool",
+        partType: "text",
         ordinal: 0,
+        textContent: "tail tool call",
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "text",
+        }),
+      },
+      {
+        sessionId: "session-tail-tool-pair",
+        partType: "tool",
+        ordinal: 1,
         toolCallId: "call_tail",
         toolName: "read",
         toolInput: JSON.stringify({ path: "foo.txt" }),
@@ -896,15 +1024,242 @@ describe("LCM integration: ingest -> assemble", () => {
 
     const result = await assembler.assemble({
       conversationId: CONV_ID,
-      tokenBudget: 1,
+      tokenBudget: 1_000,
       freshTailCount: 2,
     });
 
-    expect(result.messages).toHaveLength(3);
+    expect(result.messages).toHaveLength(2);
     expect(result.messages[0].role).toBe("assistant");
-    expect(result.messages[1].role).toBe("toolResult");
-    expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_tail");
-    expect(extractMessageText(result.messages[2].content)).toBe("tail marker");
+    expect(extractMessageText(result.messages[0].content)).toContain("tail tool call");
+    expect(
+      Array.isArray(result.messages[0].content) &&
+      result.messages[0].content.some(
+        (block) =>
+          block &&
+          typeof block === "object" &&
+          "type" in block &&
+          [
+            "toolCall",
+            "toolUse",
+            "tool_use",
+            "tool-use",
+            "functionCall",
+            "function_call",
+          ].includes((block as { type?: string }).type ?? ""),
+      ),
+    ).toBe(false);
+    expect(result.messages[1].role).toBe("user");
+    expect(extractMessageText(result.messages[1].content)).toBe("tail marker");
+    expect(result.messages.some((message) => message.role === "toolResult")).toBe(false);
+    expect(result.debug).toMatchObject({
+      selectionMode: "full-fit",
+      promotedToolResultCount: 0,
+      promotedOrdinals: [],
+      freshTailOrdinal: 1,
+      baseFreshTailCount: 2,
+      freshTailCount: 2,
+    });
+    expect(result.debug?.finalMessagesHash).toMatch(/^[0-9a-f]{16}$/);
+    expect(result.debug?.preSanitizeMessagesHash).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("keeps assembled prompt prefixes stable across append-only turns", async () => {
+    await convStore.createConversation({ sessionId: "session-tail-tool-prefix-stability" });
+
+    const toolResultMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "tool",
+      content: "real tool result",
+      tokenCount: estimateTokens("real tool result"),
+    });
+    await convStore.createMessageParts(toolResultMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-prefix-stability",
+        partType: "tool",
+        ordinal: 0,
+        textContent: "real tool result",
+        toolCallId: "call_stable",
+        toolName: "read",
+        metadata: JSON.stringify({
+          originalRole: "toolResult",
+          rawType: "tool_result",
+          toolCallId: "call_stable",
+          toolName: "read",
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, toolResultMsg.messageId);
+
+    const assistantMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 2,
+      role: "assistant",
+      content: "stable tool call",
+      tokenCount: estimateTokens("stable tool call"),
+    });
+    await convStore.createMessageParts(assistantMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-prefix-stability",
+        partType: "text",
+        ordinal: 0,
+        textContent: "stable tool call",
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "text",
+        }),
+      },
+      {
+        sessionId: "session-tail-tool-prefix-stability",
+        partType: "tool",
+        ordinal: 1,
+        toolCallId: "call_stable",
+        toolName: "read",
+        toolInput: JSON.stringify({ path: "foo.txt" }),
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "toolCall",
+          raw: {
+            type: "toolCall",
+            id: "call_stable",
+            name: "read",
+            input: { path: "foo.txt" },
+          },
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, assistantMsg.messageId);
+
+    const turnOneMarker = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 3,
+      role: "user",
+      content: "turn one tail marker",
+      tokenCount: estimateTokens("turn one tail marker"),
+    });
+    await sumStore.appendContextMessage(CONV_ID, turnOneMarker.messageId);
+
+    const turnOne = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      freshTailCount: 2,
+    });
+
+    for (const [seq, content] of [
+      [4, "turn two tail marker"],
+      [5, "turn three tail marker"],
+    ] as const) {
+      const message = await convStore.createMessage({
+        conversationId: CONV_ID,
+        seq,
+        role: "user",
+        content,
+        tokenCount: estimateTokens(content),
+      });
+      await sumStore.appendContextMessage(CONV_ID, message.messageId);
+    }
+
+    const turnTwo = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      freshTailCount: 2,
+    });
+
+    expect(turnOne.messages.some((message) => message.role === "toolResult")).toBe(false);
+    expect(turnTwo.messages.some((message) => message.role === "toolResult")).toBe(false);
+    expect(turnTwo.messages.slice(0, turnOne.messages.length)).toEqual(turnOne.messages);
+  });
+
+  it("does not let paired tool results bypass fresh tail token caps", async () => {
+    await convStore.createConversation({ sessionId: "session-tail-tool-pair-capped" });
+
+    const hugeToolResult = `huge tool result ${"x".repeat(4096)}`;
+    const toolResultMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "tool",
+      content: hugeToolResult,
+      tokenCount: estimateTokens(hugeToolResult),
+    });
+    await convStore.createMessageParts(toolResultMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-pair-capped",
+        partType: "tool",
+        ordinal: 0,
+        textContent: hugeToolResult,
+        toolCallId: "call_tail_capped",
+        toolName: "read",
+        metadata: JSON.stringify({
+          originalRole: "toolResult",
+          rawType: "tool_result",
+          toolCallId: "call_tail_capped",
+          toolName: "read",
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, toolResultMsg.messageId);
+
+    const assistantMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 2,
+      role: "assistant",
+      content: "tail tool call",
+      tokenCount: estimateTokens("tail tool call"),
+    });
+    await convStore.createMessageParts(assistantMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-pair-capped",
+        partType: "text",
+        ordinal: 0,
+        textContent: "tail tool call",
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "text",
+        }),
+      },
+      {
+        sessionId: "session-tail-tool-pair-capped",
+        partType: "tool",
+        ordinal: 1,
+        toolCallId: "call_tail_capped",
+        toolName: "read",
+        toolInput: JSON.stringify({ path: "foo.txt" }),
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "toolCall",
+          raw: {
+            type: "toolCall",
+            id: "call_tail_capped",
+            name: "read",
+            input: { path: "foo.txt" },
+          },
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, assistantMsg.messageId);
+
+    const trailingUser = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 3,
+      role: "user",
+      content: "tail marker",
+      tokenCount: estimateTokens("tail marker"),
+    });
+    await sumStore.appendContextMessage(CONV_ID, trailingUser.messageId);
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 120,
+      freshTailCount: 2,
+      freshTailMaxTokens: 80,
+    });
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages.some((message) => message.role === "toolResult")).toBe(false);
+    expect(result.messages[0]?.role).toBe("assistant");
+    expect(extractMessageText(result.messages[0]?.content)).toContain("tail tool call");
+    expect(result.messages[1]?.role).toBe("user");
+    expect(extractMessageText(result.messages[1]?.content)).toBe("tail marker");
   });
 
   it("degrades tool rows without toolCallId to assistant text", async () => {
@@ -984,6 +1339,109 @@ describe("LCM integration: compaction", () => {
 
     // Total context items should be fewer than the original 10
     expect(contextItems.length).toBeLessThan(10);
+  });
+
+  it("leaf compaction strips thinking/reasoning blocks from the summarizer input", async () => {
+    // Ingest a mix of messages: some with thinking blocks only, some with visible text,
+    // and some with both thinking blocks and visible text.
+    const thinkingOnlyContent = JSON.stringify([
+      { type: "thinking", thinking: "", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_abc", encrypted_content: "ENCRYPTED_PAYLOAD_XXXX" }) },
+    ]);
+    const mixedContent = JSON.stringify([
+      { type: "thinking", thinking: "Let me reason...", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_xyz", encrypted_content: "ANOTHER_ENCRYPTED" }) },
+      { type: "text", text: "Visible assistant reply." },
+    ]);
+    const reasoningTextContent = JSON.stringify([
+      { type: "reasoning", text: "PRIVATE_REASONING_TEXT" },
+      { type: "text", text: "Visible reply after reasoning text." },
+    ]);
+    const thinkingSummaryContent = JSON.stringify([
+      { type: "thinking", summary: "PRIVATE_THINKING_SUMMARY" },
+      { type: "text", text: "Visible reply after thinking summary." },
+    ]);
+    const plainContent = "A plain user message.";
+
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => plainContent,
+      roleFn: () => "user",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => thinkingOnlyContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => mixedContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => reasoningTextContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => thinkingSummaryContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    // Add extra user messages to cross the compaction threshold
+    await ingestMessages(convStore, sumStore, 7, {
+      contentFn: (i) => `Follow-up message ${i}`,
+      roleFn: () => "user",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+
+    let capturedSourceText = "";
+    const summarize = vi.fn(async (text: string) => {
+      capturedSourceText = text;
+      return "Leaf summary.";
+    });
+
+    await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).toHaveBeenCalled();
+
+    // Thinking block types and encrypted signatures must not appear in the summarizer input
+    expect(capturedSourceText).not.toContain("thinkingSignature");
+    expect(capturedSourceText).not.toContain("ENCRYPTED_PAYLOAD_XXXX");
+    expect(capturedSourceText).not.toContain("ANOTHER_ENCRYPTED");
+    expect(capturedSourceText).not.toContain('"type":"thinking"');
+    expect(capturedSourceText).not.toContain("PRIVATE_REASONING_TEXT");
+    expect(capturedSourceText).not.toContain("PRIVATE_THINKING_SUMMARY");
+
+    // The visible text from the mixed-content message must still be present
+    expect(capturedSourceText).toContain("Visible assistant reply.");
+    expect(capturedSourceText).toContain("Visible reply after reasoning text.");
+    expect(capturedSourceText).toContain("Visible reply after thinking summary.");
+
+    // The plain user message must still be present
+    expect(capturedSourceText).toContain("A plain user message.");
+  });
+
+  it("leaf-trigger accounting respects fresh tail token caps", async () => {
+    const tokenAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 4,
+      freshTailMaxTokens: 150,
+      leafChunkTokens: 200,
+    });
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Turn ${i}: ${"r".repeat(396)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const trigger = await tokenAwareEngine.evaluateLeafTrigger(CONV_ID);
+
+    expect(trigger.rawTokensOutsideTail).toBeGreaterThanOrEqual(250);
+    expect(trigger.shouldCompact).toBe(true);
   });
 
   it("compactLeaf uses preceding summary context for soft leaf continuity", async () => {
@@ -3344,6 +3802,30 @@ describe("prompt-aware eviction", () => {
 
     const contents = result.messages.map((m) => extractMessageText(m.content)).join("\n");
     // Chronological: newer summary (painting) kept, older one (authentication) dropped
+    expect(contents).toContain("painting");
+    expect(contents).not.toContain("authentication login");
+  });
+
+  it("falls back to chronological eviction when prompt-aware eviction is disabled", async () => {
+    const olderContent = "authentication login password security token";
+    const newerContent = "painting brushes canvas art watercolor oils";
+
+    await addSummary(olderContent, "sum_older");
+    await addSummary(newerContent, "sum_newer");
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Fresh message ${i}`,
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 75,
+      freshTailCount: 4,
+      prompt: "how does authentication work",
+      promptAwareEviction: false,
+    });
+
+    const contents = result.messages.map((m) => extractMessageText(m.content)).join("\n");
     expect(contents).toContain("painting");
     expect(contents).not.toContain("authentication login");
   });

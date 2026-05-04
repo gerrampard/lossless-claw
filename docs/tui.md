@@ -237,6 +237,34 @@ The confirmation screen shows:
 
 Each interactive operation also has a standalone CLI equivalent for scripting and batch operations.
 
+### `lcm-tui doctor`
+
+Scans for genuinely truncated summaries and can rewrite them in place. This is narrower than `repair`: it looks for specific truncation marker shapes instead of the generic fallback-summary marker.
+
+```bash
+# Preview repairs for one conversation
+lcm-tui doctor 44 --show-diff
+
+# Apply repairs through Codex CLI OAuth after `codex login`
+lcm-tui doctor 44 --apply --provider openai-codex --model gpt-5.3-codex
+
+# Scan only across every conversation
+lcm-tui doctor --all
+```
+
+| Flag | Description |
+|------|-------------|
+| `--apply` | Write repaired summaries to the database |
+| `--summary` | Scan only and show counts |
+| `--all` | Scan all conversations (discovery mode only) |
+| `--provider <id>` | API provider (default: anthropic) |
+| `--model <model>` | API model (default: `claude-haiku-4-5`) |
+| `--base-url <url>` | Custom API base URL (overrides config and env) |
+| `--show-diff` | Show unified diff for each fix |
+| `--timestamps` | Inject timestamps into rewrite source text |
+
+Use `--provider openai-codex` when you want ChatGPT Plus/Pro OAuth from the Codex CLI. Keep `--provider openai` for direct OpenAI-compatible HTTP calls with a raw `OPENAI_API_KEY`, including custom `--base-url` proxies.
+
 ### `lcm-tui repair`
 
 Finds and fixes corrupted summaries (those containing the `[LCM fallback summary]` marker from failed summarization attempts).
@@ -253,6 +281,12 @@ lcm-tui repair 44 --apply
 
 # Repair a specific summary
 lcm-tui repair 44 --summary-id sum_abc123 --apply
+
+# Repair through Codex CLI OAuth after `codex login`
+lcm-tui repair 44 --apply --provider openai-codex --model gpt-5.3-codex
+
+# Repair through a custom OpenAI-compatible proxy with a raw API key
+lcm-tui repair 44 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
 ```
 
 The repair process:
@@ -260,7 +294,7 @@ The repair process:
 2. Orders them bottom-up: leaves first (in context ordinal order), then condensed nodes by ascending depth
 3. Reconstructs source material from linked messages (leaves) or child summaries (condensed)
 4. Resolves `previous_context` for each node (for deduplication in the prompt)
-5. Sends to Anthropic API with the appropriate depth prompt
+5. Sends to the resolved provider API with the appropriate depth prompt
 6. Updates the database in a single transaction
 
 | Flag | Description |
@@ -268,6 +302,9 @@ The repair process:
 | `--apply` | Write repairs to database (default: dry run) |
 | `--all` | Scan all conversations |
 | `--summary-id <id>` | Target a specific summary |
+| `--provider <id>` | API provider (inferred from `--model` when omitted) |
+| `--model <model>` | API model (default depends on provider) |
+| `--base-url <url>` | Custom API base URL (overrides config and env) |
 | `--verbose` | Show content hashes and previews |
 
 ### `lcm-tui rewrite`
@@ -284,10 +321,10 @@ lcm-tui rewrite 44 --depth 0 --apply
 # Rewrite everything bottom-up
 lcm-tui rewrite 44 --all --apply --diff
 
-# Rewrite with OpenAI Responses API
-lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --apply
+# Rewrite with Codex CLI OAuth after `codex login`
+lcm-tui rewrite 44 --summary sum_abc123 --provider openai-codex --model gpt-5.3-codex --apply
 
-# Rewrite through a custom OpenAI-compatible proxy
+# Rewrite through a custom OpenAI-compatible proxy with a raw API key
 lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai --apply
 
 # Use custom prompt templates
@@ -380,10 +417,10 @@ lcm-tui backfill my-agent session_abc123 --apply --recompact --single-root
 # Import + compact + transplant into an active conversation
 lcm-tui backfill my-agent session_abc123 --apply --transplant-to 653
 
-# Backfill using OpenAI
-lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex
+# Backfill using Codex CLI OAuth after `codex login`
+lcm-tui backfill my-agent session_abc123 --apply --provider openai-codex --model gpt-5.3-codex
 
-# Backfill through a custom OpenAI-compatible proxy
+# Backfill through a custom OpenAI-compatible proxy with a raw API key
 lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
 ```
 
@@ -484,13 +521,14 @@ Resolution order:
 
 If the provider auth profile mode is `oauth` (not `api_key`), set the provider API key environment variable explicitly.
 
-Interactive rewrite (`w`/`W`) can be configured with:
+Summary-producing operations (`doctor`, `repair`, `rewrite`, `backfill`, and interactive rewrite `w`/`W`) can be configured with:
 - `LCM_TUI_SUMMARY_PROVIDER`
 - `LCM_TUI_SUMMARY_MODEL`
 - `LCM_TUI_SUMMARY_BASE_URL`
-- `LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`)
 
 It also honors `LCM_SUMMARY_PROVIDER` / `LCM_SUMMARY_MODEL` / `LCM_SUMMARY_BASE_URL` as fallback.
+
+Separately, the conversation browser window size uses `LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`).
 
 ## Database
 

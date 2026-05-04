@@ -39,6 +39,14 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileSummaryModel: "",
       timezone: "UTC",
       pruneHeartbeatOk: false,
+      transcriptGcEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
+      autoRotateSessionFiles: {
+        enabled: true,
+        sizeBytes: 2 * 1024 * 1024,
+        startup: "rotate",
+        runtime: "rotate",
+      },
       summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(async () => ({
@@ -185,6 +193,26 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     });
 
     expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4.1", "qiniu");
+  });
+
+  it("uses resolved plugin summary config from deps when runtime config is unavailable", async () => {
+    const deps = makeDeps({
+      config: {
+        ...makeDeps().config,
+        summaryProvider: "openrouter",
+        summaryModel: "openrouter/z-ai/glm-5.1",
+      },
+    });
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {},
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith(
+      "openrouter/z-ai/glm-5.1",
+      "openrouter",
+    );
   });
 
   it("prefers env summaryModel over compaction model and session model", async () => {
@@ -1038,6 +1066,78 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("PROVIDER FALLBACK");
       expect(diagnostics).toContain("anthropic/claude-sonnet-4-6");
+    });
+
+    it("falls back to the next resolved model when the provider returns an error response", async () => {
+      const deps = makeDeps({
+        resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
+          if (modelRef === "gpt-5.4") {
+            return { provider: providerHint ?? "openai-codex", model: "gpt-5.4" };
+          }
+          if (modelRef === "anthropic/claude-sonnet-4-6") {
+            return { provider: "anthropic", model: "claude-sonnet-4-6" };
+          }
+          throw new Error(`unexpected modelRef: ${String(modelRef)}`);
+        }),
+        complete: vi.fn(async ({ provider }: { provider?: string }) => {
+          if (provider === "openai-codex") {
+            return {
+              content: [],
+              stopReason: "error",
+              errorMessage: "Not Found",
+              request_api: "openai-codex-responses",
+            };
+          }
+          return {
+            content: [{ type: "text", text: "Recovered summary from provider fallback." }],
+          };
+        }),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: {
+          provider: "openai-codex",
+          model: "gpt-5.4",
+          config: {
+            plugins: {
+              entries: {
+                "lossless-claw": {
+                  config: {
+                    summaryProvider: "openai-codex",
+                    summaryModel: "gpt-5.4",
+                  },
+                },
+              },
+            },
+            agents: {
+              defaults: {
+                model: "anthropic/claude-sonnet-4-6",
+              },
+            },
+          },
+        },
+      });
+
+      const summary = await summarize!("A".repeat(8_000), false);
+
+      expect(summary).toBe("Recovered summary from provider fallback.");
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+        provider: "openai-codex",
+        model: "gpt-5.4",
+      });
+      expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      });
+
+      const diagnostics = getDepsLogText(deps);
+      expect(diagnostics).toContain("provider error response");
+      expect(diagnostics).toContain("finish=error");
+      expect(diagnostics).toContain("PROVIDER FALLBACK");
+      expect(diagnostics).not.toContain("retrying with conservative settings");
+      expect(diagnostics).not.toContain("falling back to truncation");
     });
 
     it("falls back to the next resolved model when retry also returns an empty overloaded response", async () => {

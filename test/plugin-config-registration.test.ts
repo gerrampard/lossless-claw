@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import lcmPlugin from "../index.js";
 import * as connectionModule from "../src/db/connection.js";
 import { closeLcmConnection } from "../src/db/connection.js";
@@ -11,14 +11,20 @@ import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 
 type RegisteredEngineFactory = (() => unknown) | undefined;
 type HookHandler = (event: unknown, context: unknown) => unknown;
+type RegisteredContextEngine = { id: string; factory: () => unknown };
 
 function buildApi(
   pluginConfig: unknown,
-  options?: { includeModelAuth?: boolean; agentDir?: string },
+  options?: {
+    includeModelAuth?: boolean;
+    agentDir?: string;
+    runtimeConfig?: Record<string, unknown>;
+  },
 ): {
   api: OpenClawPluginApi;
   getFactory: () => RegisteredEngineFactory;
   getHook: (hookName: string) => HookHandler | undefined;
+  getRegisteredContextEngines: () => RegisteredContextEngine[];
   infoLog: ReturnType<typeof vi.fn>;
   warnLog: ReturnType<typeof vi.fn>;
   errorLog: ReturnType<typeof vi.fn>;
@@ -27,6 +33,7 @@ function buildApi(
   sessionWarnLog: ReturnType<typeof vi.fn>;
 } {
   let factory: RegisteredEngineFactory;
+  const registeredContextEngines: RegisteredContextEngine[] = [];
   const hooks = new Map<string, HookHandler[]>();
   const infoLog = vi.fn();
   const warnLog = vi.fn();
@@ -58,7 +65,7 @@ function buildApi(
             },
           }),
       config: {
-        loadConfig: vi.fn(() => ({})),
+        loadConfig: vi.fn(() => options?.runtimeConfig ?? {}),
       },
       logging: {
         getChildLogger: vi.fn(() => ({
@@ -80,7 +87,8 @@ function buildApi(
       error: vi.fn(),
       debug: vi.fn(),
     },
-    registerContextEngine: vi.fn((_id: string, nextFactory: () => unknown) => {
+    registerContextEngine: vi.fn((id: string, nextFactory: () => unknown) => {
+      registeredContextEngines.push({ id, factory: nextFactory });
       factory = nextFactory;
     }),
     registerTool: vi.fn(),
@@ -105,6 +113,7 @@ function buildApi(
     api,
     getFactory: () => factory,
     getHook: (hookName: string) => hooks.get(hookName)?.[0],
+    getRegisteredContextEngines: () => [...registeredContextEngines],
     infoLog,
     warnLog,
     errorLog,
@@ -171,6 +180,16 @@ describe("lcm plugin registration", () => {
     tempDirs.clear();
   });
 
+  it("registers only the lossless-claw context engine id", () => {
+    const { api, getRegisteredContextEngines } = buildApi({ enabled: true });
+
+    lcmPlugin.register(api);
+
+    expect(getRegisteredContextEngines()).toEqual([
+      expect.objectContaining({ id: "lossless-claw" }),
+    ]);
+  });
+
   it("uses api.pluginConfig values during register", { timeout: 20000 }, () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
@@ -180,12 +199,15 @@ describe("lcm plugin registration", () => {
       contextThreshold: 0.33,
       incrementalMaxDepth: -1,
       freshTailCount: 7,
+      promptAwareEviction: false,
       leafChunkTokens: 80000,
       newSessionRetainDepth: 4,
       dbPath,
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
+      transcriptGcEnabled: true,
+      proactiveThresholdCompactionMode: "inline",
       largeFileThresholdTokens: 12345,
     });
     lcmPlugin.register(api);
@@ -204,28 +226,42 @@ describe("lcm plugin registration", () => {
     const factory = getFactory();
     expect(factory).toBeTypeOf("function");
 
-    const engine = factory!() as { config: Record<string, unknown> };
+    const engine = factory!() as {
+      config: Record<string, unknown>;
+      info?: Record<string, unknown>;
+    };
     expect(engine.config).toMatchObject({
       enabled: true,
       contextThreshold: 0.33,
       incrementalMaxDepth: -1,
       freshTailCount: 7,
+      promptAwareEviction: false,
       newSessionRetainDepth: 4,
       leafChunkTokens: 80000,
       databasePath: dbPath,
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
+      transcriptGcEnabled: true,
+      proactiveThresholdCompactionMode: "inline",
       largeFileTokenThreshold: 12345,
     });
+    expect(engine.info).toMatchObject({
+      id: "lossless-claw",
+      turnMaintenanceMode: "background",
+    });
     expect(infoLog).toHaveBeenCalledWith(
-      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=inline)`,
+    );
+    expect(infoLog).toHaveBeenCalledWith("[lcm] Transcript GC enabled (default false)");
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Proactive threshold compaction mode: inline (default deferred)",
     );
     expect(infoLog).toHaveBeenCalledWith(
-      "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
+      "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
     );
     expect(infoLog).toHaveBeenCalledWith(
-      "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
+      "[lcm] Stateless session patterns from plugin config: 1 pattern(s): agent:*:subagent:**",
     );
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: (unconfigured)",
@@ -234,6 +270,33 @@ describe("lcm plugin registration", () => {
     expect(debugLog).toHaveBeenCalledWith(expect.stringContaining("[lcm] Migration successful"));
     expect(api.on).toHaveBeenCalledWith("before_reset", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("session_end", expect.any(Function));
+  });
+
+  it("logs env-backed pattern sources and override warnings during register", () => {
+    vi.stubEnv("LCM_IGNORE_SESSION_PATTERNS", "agent:*:cron:*, agent:main:subagent:**");
+    vi.stubEnv("LCM_STATELESS_SESSION_PATTERNS", "agent:*:ephemeral:**");
+
+    const { api, infoLog, warnLog } = buildApi({
+      enabled: true,
+      ignoreSessionPatterns: ["agent:*:test:*"],
+      statelessSessionPatterns: ["agent:*:preview:*"],
+      skipStatelessSessions: true,
+    });
+
+    lcmPlugin.register(api);
+
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Ignoring sessions matching 2 pattern(s) from env: agent:*:cron:*, agent:main:subagent:**",
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Stateless session patterns from env: 1 pattern(s): agent:*:ephemeral:**",
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      "[lcm] LCM_IGNORE_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.ignoreSessionPatterns; plugin config array will be ignored",
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      "[lcm] LCM_STATELESS_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.statelessSessionPatterns; plugin config array will be ignored",
+    );
   });
 
   it.each([
@@ -477,6 +540,66 @@ describe("lcm plugin registration", () => {
     expect(sessionInfoLog).not.toHaveBeenCalled();
   });
 
+  it("falls back to runtime plugin config for the startup banner when register runs before api.pluginConfig is populated", () => {
+    const { api, infoLog } = buildApi(
+      {},
+      {
+        runtimeConfig: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+                config: {
+                  summaryModel: "openai-codex/gpt-5.4",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+    api.config = {} as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: openai-codex/gpt-5.4 (override)",
+    );
+  });
+
+  it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
+    const { api, getFactory, infoLog } = buildApi(
+      {
+        enabled: true,
+      },
+      {
+        runtimeConfig: compactionAndDefaultModelConfig({
+          defaultModel: "anthropic/claude-sonnet-4-6",
+        }),
+      },
+    );
+    api.config = {} as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: anthropic/claude-sonnet-4-6 (default)",
+    );
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel(undefined, undefined) as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
+  });
+
   it("logs the OpenClaw compaction model at startup when no plugin override is set", () => {
     const { api, infoLog } = buildApi({
       enabled: true,
@@ -520,6 +643,7 @@ describe("lcm plugin registration", () => {
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
+      proactiveThresholdCompactionMode: "deferred",
     };
     const first = buildApi(pluginConfig);
     const second = buildApi(pluginConfig);
@@ -543,17 +667,21 @@ describe("lcm plugin registration", () => {
     const startupBannerMessages = [...firstMessages, ...secondMessages].filter((message) =>
       [
         "[lcm] Plugin loaded (enabled=true, db=",
+        "[lcm] Transcript GC ",
+        "[lcm] Proactive threshold compaction mode:",
         "[lcm] Compaction summarization model:",
         "[lcm] Ignoring sessions matching ",
-        "[lcm] Stateless session patterns:",
+        "[lcm] Stateless session patterns",
       ].some((prefix) => message.startsWith(prefix)),
     );
 
     expect(startupBannerMessages.sort()).toEqual([
-      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=deferred)`,
+      "[lcm] Transcript GC disabled (default false)",
+      "[lcm] Proactive threshold compaction mode: deferred (default deferred)",
       "[lcm] Compaction summarization model: (unconfigured)",
-      "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
-      "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
+      "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
+      "[lcm] Stateless session patterns from plugin config: 1 pattern(s): agent:*:subagent:**",
     ].sort());
     expect(firstSessionMessages).toEqual([]);
     expect(secondSessionMessages).toEqual([]);

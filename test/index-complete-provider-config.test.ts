@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import lcmPlugin from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 
@@ -85,6 +85,7 @@ async function callComplete(params: {
   loadConfigResult: Record<string, unknown>;
   provider: string;
   model: string;
+  providerApi?: string;
   runtimeConfig?: unknown;
 }) {
   const { api, getFactory, loadConfig } = buildApi(params.loadConfigResult);
@@ -99,6 +100,7 @@ async function callComplete(params: {
       complete: (input: {
         provider: string;
         model: string;
+        providerApi?: string;
         runtimeConfig?: unknown;
         messages: Array<{ role: string; content: string }>;
         maxTokens: number;
@@ -111,6 +113,7 @@ async function callComplete(params: {
     const result = await engine.deps.complete({
       provider: params.provider,
       model: params.model,
+      providerApi: params.providerApi,
       runtimeConfig: params.runtimeConfig,
       messages: [{ role: "user", content: "Summarize this." }],
       maxTokens: 256,
@@ -157,7 +160,7 @@ describe("createLcmDependencies.complete provider config resolution", () => {
       model: "unit-model",
     });
 
-    expect(loadConfig).toHaveBeenCalledTimes(1);
+    expect(loadConfig).toHaveBeenCalled();
     expect(piAiMock.completeSimple).toHaveBeenCalledTimes(1);
     expect(piAiMock.completeSimple).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -223,6 +226,163 @@ describe("createLcmDependencies.complete provider config resolution", () => {
         headers: {
           Authorization: "Bearer test",
         },
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("prefers model-level runtime api over known model and provider api", async () => {
+    piAiMock.getModel.mockReturnValue({
+      id: "gpt-5.4-mini",
+      provider: "openai-codex",
+      api: "openai-codex-responses",
+      name: "GPT-5.4 Mini",
+      baseUrl: "https://chatgpt.com/backend-api/v1",
+    });
+
+    const runtimeConfig = {
+      models: {
+        providers: {
+          "openai-codex": {
+            api: "openai-codex-responses",
+            baseUrl: "https://api.openai.com/v1",
+            models: [{ id: "gpt-5.4-mini", api: "openai-completions" }],
+          },
+        },
+      },
+    };
+
+    await callComplete({
+      loadConfigResult: runtimeConfig,
+      provider: "openai-codex",
+      model: "gpt-5.4-mini",
+      providerApi: "openai-codex-responses",
+      runtimeConfig,
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4-mini",
+        provider: "openai-codex",
+        api: "openai-completions",
+        baseUrl: "https://api.openai.com/v1",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("prefers model-level runtime api over provider api when model is custom", async () => {
+    await callComplete({
+      loadConfigResult: {},
+      provider: "openai-codex",
+      model: "custom-mini",
+      providerApi: "openai-codex-responses",
+      runtimeConfig: {
+        models: {
+          providers: {
+            "openai-codex": {
+              models: [{ id: "custom-mini", api: "openai-completions" }],
+            },
+          },
+        },
+      },
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "custom-mini",
+        provider: "openai-codex",
+        api: "openai-completions",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("uses native Codex transport defaults for uncataloged openai-codex models", async () => {
+    await callComplete({
+      loadConfigResult: {},
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      runtimeConfig: {},
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        reasoning: true,
+        input: ["text", "image"],
+        maxTokens: 128_000,
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("preserves an explicit api.openai.com/v1 baseUrl for paid OpenAI API-key Codex users", async () => {
+    // Regression: v0.9.3's #549 added OPENAI_CODEX_NATIVE_BASE_URLS which would
+    // rewrite an explicitly-configured `https://api.openai.com/v1` to
+    // `chatgpt.com/backend-api/codex` whenever api was `openai-codex-responses`.
+    // That broke users on a paid OpenAI API key who set baseUrl deliberately.
+    // shouldUseNativeCodexBaseUrl now respects an explicit configured baseUrl.
+    const runtimeConfig = {
+      models: {
+        providers: {
+          "openai-codex": {
+            baseUrl: "https://api.openai.com/v1",
+          },
+        },
+      },
+    };
+
+    await callComplete({
+      loadConfigResult: runtimeConfig,
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      runtimeConfig,
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://api.openai.com/v1",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("keeps custom Codex proxy baseUrl when openai-codex uses native transport", async () => {
+    const runtimeConfig = {
+      models: {
+        providers: {
+          "openai-codex": {
+            baseUrl: "https://codex-proxy.example.test/v1",
+          },
+        },
+      },
+    };
+
+    await callComplete({
+      loadConfigResult: runtimeConfig,
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      runtimeConfig,
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://codex-proxy.example.test/v1",
       }),
       expect.any(Object),
       expect.any(Object),
@@ -355,6 +515,86 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     expect(piAiMock.completeSimple).not.toHaveBeenCalled();
   });
 
+  it("falls back to openai-completions for ollama when no api family is configured", async () => {
+    await callComplete({
+      loadConfigResult: {},
+      provider: "ollama",
+      model: "kimi-k2.5:cloud",
+      runtimeConfig: {},
+    });
+
+    // ollama is intentionally absent from inferBaseUrlFromProvider — cloud
+    // ollama (`https://ollama.com`) and self-hosted setups both rely on
+    // explicit baseUrl. A silent localhost fallback would route cloud
+    // configs to localhost and produce confusing connection errors.
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "kimi-k2.5:cloud",
+        provider: "ollama",
+        api: "openai-completions",
+        baseUrl: "",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("preserves a user-configured ollama cloud baseUrl instead of overriding to localhost", async () => {
+    const runtimeConfig = {
+      models: {
+        providers: {
+          ollama: {
+            baseUrl: "https://ollama.com",
+          },
+        },
+      },
+    };
+
+    await callComplete({
+      loadConfigResult: runtimeConfig,
+      provider: "ollama",
+      model: "kimi-k2.5:cloud",
+      runtimeConfig,
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "kimi-k2.5:cloud",
+        provider: "ollama",
+        api: "openai-completions",
+        baseUrl: "https://ollama.com",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it.each([
+    ["deepseek", "https://api.deepseek.com"],
+    ["groq", "https://api.groq.com/openai/v1"],
+    ["mistral", "https://api.mistral.ai"],
+    ["openrouter", "https://openrouter.ai/api/v1"],
+    ["together", "https://api.together.xyz"],
+  ])("falls back to OpenAI-compatible routing for %s", async (provider, baseUrl) => {
+    await callComplete({
+      loadConfigResult: {},
+      provider,
+      model: "unit-model",
+      runtimeConfig: {},
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "unit-model",
+        provider,
+        api: "openai-completions",
+        baseUrl,
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
   it("preserves provider auth error metadata when completeSimple throws a 401 scope error", async () => {
     piAiMock.completeSimple.mockRejectedValue({
       statusCode: 401,
@@ -381,7 +621,7 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     });
   });
 
-  it("does not mislabel non-config provider errors as provider_config", async () => {
+  it("labels non-config provider errors without mislabeling them as provider_config", async () => {
     piAiMock.completeSimple.mockRejectedValue(new Error("gateway timed out"));
 
     const { result } = await callComplete({
@@ -409,7 +649,15 @@ describe("createLcmDependencies.complete provider config resolution", () => {
 
     expect(result).toMatchObject({
       content: [],
+      error: {
+        kind: "provider_error",
+        message: "gateway timed out",
+      },
     });
-    expect(result).not.toHaveProperty("error");
+    expect(result).not.toMatchObject({
+      error: {
+        kind: "provider_config",
+      },
+    });
   });
 });

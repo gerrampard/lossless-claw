@@ -44,6 +44,14 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    transcriptGcEnabled: false,
+    proactiveThresholdCompactionMode: "deferred",
+    autoRotateSessionFiles: {
+      enabled: true,
+      sizeBytes: 2 * 1024 * 1024,
+      startup: "rotate",
+      runtime: "rotate",
+    },
     summaryMaxOverageFactor: 3,
     delegationTimeoutMs: 120000,
     customInstructions: "",
@@ -52,9 +60,12 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     fallbackProviders: [],
     cacheAwareCompaction: {
       enabled: true,
+      cacheTTLSeconds: 300,
       maxColdCacheCatchupPasses: 2,
       hotCachePressureFactor: 4,
       hotCacheBudgetHeadroomRatio: 0.2,
+      coldCacheObservationThreshold: 3,
+      criticalBudgetPressureRatio: 0.70,
     },
     dynamicLeafChunkTokens: {
       enabled: true,
@@ -340,6 +351,7 @@ describe("Circuit Breaker", () => {
   it("should scope provider-backed breakers to the resolved provider/model", async () => {
     const config = createTestConfig({ circuitBreakerThreshold: 1 });
     const providerDeps = createTestDeps(config);
+    let summaryOrdinal = 0;
     providerDeps.complete = async (params) => {
       if (params.provider === "broken-provider") {
         throw new LcmProviderAuthError({
@@ -348,7 +360,12 @@ describe("Circuit Breaker", () => {
           failure: { statusCode: 401, message: "auth failed", missingModelRequestScope: false },
         });
       }
-      return { content: [{ type: "text", text: "Summary" }] };
+      return {
+        content: [{
+          type: "text",
+          text: `Summary ${params.provider ?? "unknown"} ${params.model ?? "unknown"} ${summaryOrdinal++}`,
+        }],
+      };
     };
 
     const scopedDb = new DatabaseSync(":memory:");

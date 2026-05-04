@@ -7,8 +7,8 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { resolveLcmConfig } from "../db/config.js";
+import type { OpenClawPluginApi } from "../openclaw-bridge.js";
+import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
@@ -20,7 +20,7 @@ import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
-import type { LcmDependencies } from "../types.js";
+import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -46,6 +46,73 @@ function normalizeAgentId(agentId: string | undefined): string {
   return normalized.length > 0 ? normalized : "main";
 }
 
+type RuntimeSessionStoreEntry = {
+  sessionId?: unknown;
+  sessionFile?: unknown;
+};
+
+type RuntimeAgentSessionApi = {
+  resolveStorePath: (store?: string, opts?: { agentId?: string }) => string;
+  loadSessionStore: (storePath: string) => Record<string, RuntimeSessionStoreEntry | undefined>;
+  resolveSessionFilePath: (
+    sessionId: string,
+    entry?: RuntimeSessionStoreEntry,
+    opts?: { agentId?: string; storePath?: string },
+  ) => string;
+};
+type RuntimeAgentSessionApiCandidate = Partial<RuntimeAgentSessionApi>;
+
+/** Return the runtime session registry API when the host exposes it. */
+function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionApi | undefined {
+  const runtime = api.runtime as unknown as {
+    agent?: { session?: RuntimeAgentSessionApiCandidate };
+    channel?: { session?: RuntimeAgentSessionApiCandidate };
+  };
+  const sessionApi = runtime.agent?.session ?? runtime.channel?.session;
+  if (!sessionApi) {
+    return undefined;
+  }
+  if (
+    typeof sessionApi.resolveStorePath !== "function" ||
+    typeof sessionApi.loadSessionStore !== "function" ||
+    typeof sessionApi.resolveSessionFilePath !== "function"
+  ) {
+    return undefined;
+  }
+  return sessionApi as RuntimeAgentSessionApi;
+}
+
+/** List configured OpenClaw agent ids whose session stores can be active at startup. */
+function listConfiguredAgentIds(config: unknown): string[] {
+  const agents = isRecord(config) ? config.agents : undefined;
+  const list = isRecord(agents) && Array.isArray(agents.list) ? agents.list : [];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+
+  for (const entry of list) {
+    if (!isRecord(entry) || entry.enabled === false || typeof entry.id !== "string") {
+      continue;
+    }
+    const agentId = normalizeAgentId(entry.id);
+    if (seen.has(agentId)) {
+      continue;
+    }
+    seen.add(agentId);
+    ids.push(agentId);
+  }
+
+  return ids.length > 0 ? ids : ["main"];
+}
+
+/** Read a string value from an unknown object field. */
+function getStringField(
+  record: Record<string, unknown> | undefined,
+  key: string,
+): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
 type PluginEnvSnapshot = {
   lcmSummaryModel: string;
   lcmSummaryProvider: string;
@@ -55,6 +122,8 @@ type PluginEnvSnapshot = {
   openclawDefaultModel: string;
   agentDir: string;
   home: string;
+  /** Active OpenClaw state directory — respects OPENCLAW_STATE_DIR for multi-profile hosts. */
+  stateDir: string;
 };
 
 type ReadEnvFn = (key: string) => string | undefined;
@@ -150,7 +219,7 @@ const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
 const AUTH_ERROR_NESTED_KEYS = ["error", "response", "cause", "details", "data", "body"] as const;
 
 type CompletionBridgeErrorInfo = {
-  kind: "provider_auth";
+  kind: "provider_auth" | "provider_error";
   statusCode?: number;
   code?: string;
   message?: string;
@@ -199,6 +268,28 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "- Optional: `maxTokens` (default 2000), `conversationId`, `allConversations: true`",
   "- Keep raw summary IDs out of normal user-facing prose unless the user explicitly asks for sources or IDs.",
   "",
+  "## Compacted Conversation Context",
+  "",
+  "If compacted summaries appear above, treat them as compressed recall cues rather than proof of exact wording or exact values.",
+  "",
+  "If a summary includes an \"Expand for details about:\" footer, use it as a cue to expand before asserting specifics.",
+  "",
+  "For exact commands, SHAs, paths, timestamps, config values, or causal chains, expand for details before answering.",
+  "",
+  "State uncertainty instead of guessing from compacted summaries.",
+  "",
+  "**Precision flow:**",
+  "1. `lcm_grep` to find the relevant summaries or messages",
+  "2. `lcm_expand_query` when you need exact evidence before answering",
+  "3. Answer from the retrieved evidence instead of summary paraphrase",
+  "",
+  "**Uncertainty checklist:**",
+  "- Am I making an exact factual claim from compacted context?",
+  "- Could compaction have omitted a crucial detail?",
+  "- Would I need an expansion step if the user asks for proof or exact text?",
+  "",
+  "If yes to any item, expand first or explicitly say that you need to expand.",
+  "",
   "These precedence rules apply only to compacted conversation history. Lossless-claw does not supersede memory tools globally.",
   "",
   "If a summary conflicts with newer evidence, prefer the newer evidence. Do not guess exact commands, SHAs, paths, timestamps, config values, or causal claims from compacted summaries when expansion is needed.",
@@ -215,6 +306,7 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
     openclawDefaultModel: "",
     agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
     home: env.HOME?.trim() ?? "",
+    stateDir: resolveOpenclawStateDir(env),
   };
 }
 
@@ -326,6 +418,26 @@ function detectProviderAuthError(error: unknown): CompletionBridgeErrorInfo | un
   };
 }
 
+function detectProviderBridgeError(error: unknown): CompletionBridgeErrorInfo {
+  const statusCode = extractErrorStatusCode(error);
+  const directCode =
+    isRecord(error) && typeof error.code === "string" && error.code.trim()
+      ? error.code.trim()
+      : isRecord(error) &&
+          isRecord(error.error) &&
+          typeof error.error.code === "string" &&
+          error.error.code.trim()
+        ? error.error.code.trim()
+        : undefined;
+
+  return {
+    kind: "provider_error",
+    ...(statusCode !== undefined ? { statusCode } : {}),
+    ...(directCode ? { code: directCode } : {}),
+    message: truncateErrorMessage(describeLogError(error)),
+  };
+}
+
 /** Read OpenClaw's configured default model from the validated runtime config. */
 function readDefaultModelFromConfig(config: unknown): string {
   if (!config || typeof config !== "object") {
@@ -339,6 +451,72 @@ function readDefaultModelFromConfig(config: unknown): string {
 
   const primary = (model as { primary?: unknown } | undefined)?.primary;
   return typeof primary === "string" ? primary.trim() : "";
+}
+
+/** Load the best available validated OpenClaw config during plugin registration. */
+function loadEffectiveOpenClawConfig(api: OpenClawPluginApi): unknown {
+  try {
+    const runtimeConfig = api.runtime.config.loadConfig();
+    if (runtimeConfig !== undefined) {
+      if (isRecord(runtimeConfig) && Object.keys(runtimeConfig).length > 0) {
+        return runtimeConfig;
+      }
+      if (!isRecord(api.config) || Object.keys(api.config).length === 0) {
+        return runtimeConfig;
+      }
+    }
+  } catch {
+    // Older runtimes or early startup can leave loadConfig unavailable.
+  }
+  return api.config;
+}
+
+/** Read this plugin's config from the validated OpenClaw runtime config. */
+function readPluginConfigFromOpenClawConfig(
+  openClawConfig: unknown,
+  pluginId: string,
+): Record<string, unknown> | undefined {
+  if (!isRecord(openClawConfig)) {
+    return undefined;
+  }
+
+  const plugins = openClawConfig.plugins;
+  if (!isRecord(plugins)) {
+    return undefined;
+  }
+
+  const entries = plugins.entries;
+  if (!isRecord(entries)) {
+    return undefined;
+  }
+
+  const entry = entries[pluginId];
+  if (!isRecord(entry) || !isRecord(entry.config)) {
+    return undefined;
+  }
+
+  return entry.config;
+}
+
+/** Resolve the config surfaces that should drive registration-time behavior. */
+function resolveRegistrationConfig(api: OpenClawPluginApi): {
+  openClawConfig: unknown;
+  pluginConfig?: Record<string, unknown>;
+} {
+  const openClawConfig = loadEffectiveOpenClawConfig(api);
+  const apiPluginConfig =
+    api.pluginConfig && typeof api.pluginConfig === "object" && !Array.isArray(api.pluginConfig)
+      ? api.pluginConfig
+      : undefined;
+
+  if (apiPluginConfig && Object.keys(apiPluginConfig).length > 0) {
+    return { openClawConfig, pluginConfig: apiPluginConfig };
+  }
+
+  return {
+    openClawConfig,
+    pluginConfig: readPluginConfigFromOpenClawConfig(openClawConfig, api.id),
+  };
 }
 
 /** Read OpenClaw's configured compaction model from the validated runtime config. */
@@ -535,26 +713,169 @@ function normalizeProviderId(provider: string): string {
   return provider.trim().toLowerCase();
 }
 
+const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+const OPENAI_CODEX_RESPONSES_API = "openai-codex-responses";
+const OPENAI_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
+const OPENAI_CODEX_NATIVE_BASE_URLS = new Set([
+  "https://chatgpt.com/backend-api",
+  "https://chatgpt.com/backend-api/v1",
+  OPENAI_CODEX_RESPONSES_BASE_URL,
+  `${OPENAI_CODEX_RESPONSES_BASE_URL}/v1`,
+]);
+const OPENAI_CODEX_NATIVE_MODEL_IDS = new Set([
+  "gpt-5.2",
+  "gpt-5.2-codex",
+  "gpt-5.3-codex",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.4-pro",
+  "gpt-5.5",
+  "gpt-5.5-pro",
+]);
+
+function isOpenAICodexProvider(provider: string): boolean {
+  return normalizeProviderId(provider) === OPENAI_CODEX_PROVIDER_ID;
+}
+
+function isOpenAICodexResponsesApi(api: string | undefined): boolean {
+  return (api ?? "").trim().toLowerCase() === OPENAI_CODEX_RESPONSES_API;
+}
+
+function normalizeBaseUrl(value: string): string {
+  return value.trim().replace(/\/+$/, "");
+}
+
+function shouldUseNativeCodexBaseUrl(params: {
+  provider: string;
+  api: string | undefined;
+  baseUrl: string | undefined;
+  /** True when the user explicitly set baseUrl via runtime config. When
+   *  explicit, do not rewrite `https://api.openai.com/v1` to the ChatGPT
+   *  Codex backend — that breaks paid OpenAI API-key users who chose that
+   *  endpoint deliberately. The native rewrite still applies when the
+   *  baseUrl is empty (default) or already a ChatGPT Codex variant. */
+  isExplicitlyConfigured?: boolean;
+}): boolean {
+  if (!isOpenAICodexProvider(params.provider) || !isOpenAICodexResponsesApi(params.api)) {
+    return false;
+  }
+
+  const baseUrl = params.baseUrl?.trim();
+  if (!baseUrl) {
+    return true;
+  }
+
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (params.isExplicitlyConfigured && normalized === OPENAI_API_BASE_URL) {
+    return false;
+  }
+  return normalized === OPENAI_API_BASE_URL || OPENAI_CODEX_NATIVE_BASE_URLS.has(normalized);
+}
+
+function resolveProviderModelBaseUrl(params: {
+  provider: string;
+  api: string | undefined;
+  configuredBaseUrl: unknown;
+  fallbackBaseUrl: unknown;
+}): string {
+  const configuredBaseUrl =
+    typeof params.configuredBaseUrl === "string" ? params.configuredBaseUrl : undefined;
+  const fallbackBaseUrl =
+    typeof params.fallbackBaseUrl === "string" ? params.fallbackBaseUrl : undefined;
+  const baseUrl =
+    configuredBaseUrl ?? fallbackBaseUrl ?? inferBaseUrlFromProvider(params.provider) ?? "";
+  return shouldUseNativeCodexBaseUrl({
+    provider: params.provider,
+    api: params.api,
+    baseUrl,
+    isExplicitlyConfigured: configuredBaseUrl !== undefined,
+  })
+    ? OPENAI_CODEX_RESPONSES_BASE_URL
+    : baseUrl;
+}
+
+function getOpenAICodexNativeModelDefaults(params: {
+  provider: string;
+  model: string;
+  api: string | undefined;
+}): {
+  reasoning?: boolean;
+  input?: string[];
+  contextWindow?: number;
+  maxTokens?: number;
+} {
+  // OpenClaw can know about newer ChatGPT Codex models before the pi-ai
+  // package does.  Give those uncataloged models the same broad capabilities as
+  // the native Codex provider instead of falling back to a text-only stub.
+  if (
+    !isOpenAICodexProvider(params.provider) ||
+    !isOpenAICodexResponsesApi(params.api) ||
+    !OPENAI_CODEX_NATIVE_MODEL_IDS.has(params.model.trim().toLowerCase())
+  ) {
+    return {};
+  }
+
+  return {
+    reasoning: true,
+    input: ["text", "image"],
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+  };
+}
+
 /** Resolve known provider API defaults when model lookup misses. */
 function inferApiFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
     anthropic: "anthropic-messages",
+    deepseek: "openai-completions",
+    groq: "openai-completions",
+    mistral: "openai-completions",
     openai: "openai-responses",
-    "openai-codex": "openai-codex-responses",
-    "github-copilot": "openai-codex-responses",
+    [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_RESPONSES_API,
+    "github-copilot": OPENAI_CODEX_RESPONSES_API,
+    openrouter: "openai-completions",
+    together: "openai-completions",
     google: "google-generative-ai",
     "google-gemini-cli": "google-gemini-cli",
     "google-antigravity": "google-gemini-cli",
     "google-vertex": "google-vertex",
     "amazon-bedrock": "bedrock-converse-stream",
+    ollama: "openai-completions",
   };
   return map[normalized];
 }
 
 /** Codex Responses rejects `temperature`; omit it for that API family. */
 export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
-  return (api ?? "").trim().toLowerCase() === "openai-codex-responses";
+  return isOpenAICodexResponsesApi(api);
+}
+
+/** Resolve known provider base URLs when model lookup misses.
+ *
+ *  Note: ollama is intentionally absent. Cloud Ollama (`https://ollama.com`)
+ *  and self-hosted setups both rely on explicit baseUrl configuration; a
+ *  silent `http://localhost:11434` fallback would silently route cloud
+ *  configs to localhost and produce confusing connection errors. Returning
+ *  undefined here drops the inferred default — `resolveProviderModelBaseUrl`
+ *  still passes `""` through to the dispatcher when no other source yields
+ *  a baseUrl, which surfaces a clearer downstream error than a silent
+ *  wrong-target connect. */
+function inferBaseUrlFromProvider(provider: string): string | undefined {
+  const normalized = normalizeProviderId(provider);
+  const map: Record<string, string> = {
+    anthropic: "https://api.anthropic.com",
+    deepseek: "https://api.deepseek.com",
+    openai: "https://api.openai.com/v1",
+    "openai-codex": "https://api.openai.com/v1",
+    google: "https://generativelanguage.googleapis.com/v1beta",
+    groq: "https://api.groq.com/openai/v1",
+    mistral: "https://api.mistral.ai",
+    together: "https://api.together.xyz",
+    openrouter: "https://openrouter.ai/api/v1",
+  };
+  return map[normalized];
 }
 
 /** Build provider-aware options for pi-ai completeSimple. */
@@ -583,6 +904,30 @@ export function buildCompleteSimpleOptions(params: {
   }
 
   return options;
+}
+
+/**
+ * Prefer an explicit reasoning setting, otherwise apply a caller-provided
+ * default only when the resolved model advertises reasoning support.
+ */
+export function resolveEffectiveReasoning(params: {
+  reasoning: string | undefined;
+  reasoningIfSupported: string | undefined;
+  modelSupportsReasoning: boolean | undefined;
+}): string | undefined {
+  if (typeof params.reasoning === "string" && params.reasoning.trim()) {
+    return params.reasoning.trim();
+  }
+
+  if (
+    params.modelSupportsReasoning === true &&
+    typeof params.reasoningIfSupported === "string" &&
+    params.reasoningIfSupported.trim()
+  ) {
+    return params.reasoningIfSupported.trim();
+  }
+
+  return undefined;
 }
 
 /** Select provider-specific config values with case-insensitive provider keys. */
@@ -626,6 +971,45 @@ function resolveProviderApiFromRuntimeConfig(
   return typeof api === "string" && api.trim() ? api.trim() : undefined;
 }
 
+/**
+ * Resolve the api family for a specific model from runtime config.
+ *
+ * Walks `models.providers.<provider>.models[]` looking for a matching id and
+ * returns its `api` field if declared. Lets users override the api per model
+ * (e.g. when a single provider name maps to differently-shaped endpoints).
+ */
+export function resolveModelApiFromRuntimeConfig(
+  runtimeConfig: unknown,
+  provider: string,
+  model: string,
+): string | undefined {
+  if (!isRecord(runtimeConfig)) {
+    return undefined;
+  }
+  const providers = (runtimeConfig as { models?: { providers?: Record<string, unknown> } }).models
+    ?.providers;
+  if (!providers || !isRecord(providers)) {
+    return undefined;
+  }
+  const value = findProviderConfigValue(providers, provider);
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const models = value.models;
+  if (!Array.isArray(models)) {
+    return undefined;
+  }
+  const target = model.trim();
+  for (const entry of models) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry.id !== "string") continue;
+    if (entry.id.trim() !== target) continue;
+    const api = entry.api;
+    return typeof api === "string" && api.trim() ? api.trim() : undefined;
+  }
+  return undefined;
+}
+
 /** Resolve runtime.modelAuth from plugin runtime when available. */
 function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
   const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
@@ -641,18 +1025,24 @@ function buildModelAuthLookupModel(params: {
   api?: string;
   contextWindow?: number;
 }): RuntimeModelAuthModel {
+  const api = params.api?.trim() || inferApiFromProvider(params.provider) || "";
+  const codexDefaults = getOpenAICodexNativeModelDefaults({
+    provider: params.provider,
+    model: params.model,
+    api,
+  });
   const contextWindow =
     typeof params.contextWindow === "number" && Number.isFinite(params.contextWindow) && params.contextWindow > 0
       ? params.contextWindow
-      : 1_000_000;
+      : codexDefaults.contextWindow ?? 1_000_000;
 
   return {
     id: params.model,
     name: params.model,
     provider: params.provider,
-    api: params.api?.trim() || inferApiFromProvider(params.provider) || "",
-    reasoning: false,
-    input: ["text"],
+    api,
+    reasoning: codexDefaults.reasoning ?? false,
+    input: codexDefaults.input ?? ["text"],
     cost: {
       input: 0,
       output: 0,
@@ -660,7 +1050,7 @@ function buildModelAuthLookupModel(params: {
       cacheWrite: 0,
     },
     contextWindow,
-    maxTokens: 8_000,
+    maxTokens: codexDefaults.maxTokens ?? 8_000,
   };
 }
 
@@ -825,9 +1215,9 @@ function resolveAuthStorePaths(params: { agentDir?: string; envSnapshot: PluginE
     paths.push(join(envAgentDir, "auth-profiles.json"));
   }
 
-  const home = params.envSnapshot.home;
-  if (home) {
-    paths.push(join(home, ".openclaw", "agents", "main", "agent", "auth-profiles.json"));
+  const stateDir = params.envSnapshot.stateDir;
+  if (stateDir) {
+    paths.push(join(stateDir, "agents", "main", "agent", "auth-profiles.json"));
   }
 
   return [...new Set(paths)];
@@ -905,6 +1295,7 @@ function resolveAuthProfileCandidates(params: {
 function resolveSecretRef(params: {
   ref: SecretRef | undefined;
   home: string;
+  stateDir: string;
   config?: unknown;
 }): string | undefined {
   const ref = params.ref;
@@ -957,9 +1348,9 @@ function resolveSecretRef(params: {
     // Fall through to the legacy secrets.json lookup below.
   }
 
-  // Legacy file fallback (source: "file" or unset) — read from ~/.openclaw/secrets.json
+  // Legacy file fallback (source: "file" or unset) — read from secrets.json in the active state dir
   try {
-    const secretsPath = join(params.home, ".openclaw", "secrets.json");
+    const secretsPath = join(params.stateDir, "secrets.json");
     const raw = readFileSync(secretsPath, "utf8");
     const secrets = JSON.parse(raw) as Record<string, unknown>;
     const parts = ref.id.replace(/^\//, "").split("/");
@@ -1045,6 +1436,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         resolveSecretRef({
           ref: credential.keyRef,
           home: params.envSnapshot.home,
+          stateDir: params.envSnapshot.stateDir,
           config: secretConfig,
         });
       if (key) {
@@ -1059,6 +1451,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         resolveSecretRef({
           ref: credential.tokenRef,
           home: params.envSnapshot.home,
+          stateDir: params.envSnapshot.stateDir,
           config: secretConfig,
         });
       if (!token) {
@@ -1247,14 +1640,34 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 }
 
 /** Construct LCM dependencies from plugin API/runtime surfaces. */
-function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
+function createLcmDependencies(
+  api: OpenClawPluginApi,
+  registrationConfig = resolveRegistrationConfig(api),
+): LcmDependencies {
   const envSnapshot = snapshotPluginEnv();
-  envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(api.config);
+  envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(registrationConfig.openClawConfig);
   const modelAuth = getRuntimeModelAuth(api);
   const readEnv: ReadEnvFn = (key) => process.env[key];
-  const pluginConfig = resolvePluginConfig(api);
-  const config = resolveLcmConfig(process.env, pluginConfig);
+  const pluginConfig = registrationConfig.pluginConfig;
   const log = createLcmLogger(api);
+  const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
+
+  if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
+    logStartupBannerOnce({
+      key: "ignore-session-patterns-env-override",
+      log: (message) => log.warn(message),
+      message:
+        "[lcm] LCM_IGNORE_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.ignoreSessionPatterns; plugin config array will be ignored",
+    });
+  }
+  if (diagnostics.statelessSessionPatternsEnvOverridesPluginConfig) {
+    logStartupBannerOnce({
+      key: "stateless-session-patterns-env-override",
+      log: (message) => log.warn(message),
+      message:
+        "[lcm] LCM_STATELESS_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.statelessSessionPatterns; plugin config array will be ignored",
+    });
+  }
 
   // Read model overrides from plugin config
   if (pluginConfig) {
@@ -1271,6 +1684,17 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   if (!modelAuth) {
     log.warn(buildLegacyAuthFallbackWarning());
   }
+
+  logStartupBannerOnce({
+    key: "transcript-gc-enabled",
+    log: (message) => log.info(message),
+    message: `[lcm] Transcript GC ${config.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
+  });
+  logStartupBannerOnce({
+    key: "proactive-threshold-compaction-mode",
+    log: (message) => log.info(message),
+    message: `[lcm] Proactive threshold compaction mode: ${config.proactiveThresholdCompactionMode} (default deferred)`,
+  });
 
   /** Resolve the best config object to hand to runtime.modelAuth for this lookup. */
   const resolveModelAuthConfig = (runtimeConfig: unknown): OpenClawPluginApi["config"] => {
@@ -1332,6 +1756,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
   return {
     config,
+    configDiagnostics: diagnostics,
     isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
       const normalizedProvider = normalizeProviderId(provider);
       if (normalizedProvider === "openai-codex" || normalizedProvider === "github-copilot") {
@@ -1353,6 +1778,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       maxTokens,
       temperature,
       reasoning,
+      reasoningIfSupported,
     }) => {
       try {
         const piAiModuleId = "@mariozechner/pi-ai";
@@ -1383,12 +1809,22 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
-        const fallbackApi =
-          (isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
-            ? knownModel.api.trim()
-            : undefined) ||
+        const modelRuntimeApi = resolveModelApiFromRuntimeConfig(
+          effectiveRuntimeConfig,
+          providerId,
+          modelId,
+        );
+        const providerRuntimeApi =
           providerApi?.trim() ||
-          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
+          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId);
+        const knownModelApi =
+          isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
+            ? knownModel.api.trim()
+            : undefined;
+        const fallbackApi =
+          modelRuntimeApi ||
+          providerRuntimeApi ||
+          knownModelApi ||
           (() => {
             if (typeof mod.getModels !== "function") {
               return undefined;
@@ -1423,6 +1859,16 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           return isRecord(cfg) ? cfg : {};
         })();
 
+        const resolvedKnownApi =
+          isRecord(knownModel) && typeof knownModel.api === "string"
+            ? modelRuntimeApi || providerRuntimeApi || knownModel.api
+            : undefined;
+        const codexDefaults = getOpenAICodexNativeModelDefaults({
+          provider: providerId,
+          model: modelId,
+          api: fallbackApi,
+        });
+
         let resolvedModel =
           isRecord(knownModel) &&
           typeof knownModel.api === "string" &&
@@ -1432,22 +1878,19 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api:
-                  typeof providerLevelConfig.api === "string" && providerLevelConfig.api.trim()
-                    ? providerLevelConfig.api.trim()
-                    : knownModel.api,
+                api: resolvedKnownApi ?? knownModel.api,
                 // Provider config must be able to override built-in transport defaults.
                 // Otherwise built-in providers like `openai` keep their catalog baseUrl
                 // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
                 // that provider id at a custom proxy.
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
-                baseUrl:
-                  typeof providerLevelConfig.baseUrl === "string"
-                    ? providerLevelConfig.baseUrl
-                    : typeof knownModel.baseUrl === "string"
-                      ? knownModel.baseUrl
-                      : "",
+                baseUrl: resolveProviderModelBaseUrl({
+                  provider: providerId,
+                  api: resolvedKnownApi ?? knownModel.api,
+                  configuredBaseUrl: providerLevelConfig.baseUrl,
+                  fallbackBaseUrl: knownModel.baseUrl,
+                }),
                 ...(isRecord(providerLevelConfig.headers)
                   ? {
                       headers: {
@@ -1462,21 +1905,24 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 name: modelId,
                 provider: providerId,
                 api: fallbackApi,
-                reasoning: false,
-                input: ["text"],
+                reasoning: codexDefaults.reasoning ?? false,
+                input: codexDefaults.input ?? ["text"],
                 cost: {
                   input: 0,
                   output: 0,
                   cacheRead: 0,
                   cacheWrite: 0,
                 },
-                contextWindow: 1_000_000,
-                maxTokens: 8_000,
+                contextWindow: codexDefaults.contextWindow ?? 1_000_000,
+                maxTokens: codexDefaults.maxTokens ?? 8_000,
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
-                baseUrl: typeof providerLevelConfig.baseUrl === "string"
-                  ? providerLevelConfig.baseUrl
-                  : "",
+                baseUrl: resolveProviderModelBaseUrl({
+                  provider: providerId,
+                  api: fallbackApi,
+                  configuredBaseUrl: providerLevelConfig.baseUrl,
+                  fallbackBaseUrl: undefined,
+                }),
                 ...(isRecord(providerLevelConfig.headers)
                   ? { headers: providerLevelConfig.headers }
                   : {}),
@@ -1590,19 +2036,24 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           }
         }
 
+        const effectiveReasoning = resolveEffectiveReasoning({
+          reasoning,
+          reasoningIfSupported,
+          modelSupportsReasoning: resolvedModel.reasoning,
+        });
+
         const completeOptions = buildCompleteSimpleOptions({
           api: resolvedModel.api,
           apiKey: resolvedApiKey,
           maxTokens,
           temperature,
-          reasoning,
+          reasoning: effectiveReasoning,
         });
         const requestMetadata = {
           request_provider: providerId,
           request_model: modelId,
           request_api: resolvedModel.api,
-          request_reasoning:
-            typeof reasoning === "string" && reasoning.trim() ? reasoning.trim() : "(none)",
+          request_reasoning: effectiveReasoning ?? "(none)",
           request_has_system: typeof system === "string" && system.trim().length > 0 ? "true" : "false",
           request_temperature:
             typeof completeOptions.temperature === "number"
@@ -1650,10 +2101,12 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 message: err.message,
               }
             : undefined;
+        const providerError = !authError && !configError ? detectProviderBridgeError(err) : undefined;
         return {
           content: [],
           ...(authError ? { error: authError } : {}),
           ...(configError ? { error: configError } : {}),
+          ...(providerError ? { error: providerError } : {}),
         };
       }
     },
@@ -1744,19 +2197,135 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
 
       try {
+        const sessionApi = getRuntimeAgentSessionApi(api);
+        if (!sessionApi) {
+          return undefined;
+        }
         const cfg = api.runtime.config.loadConfig();
         const parsed = parseAgentSessionKey(key);
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = api.runtime.channel.session.resolveStorePath(cfg.session?.store, {
+        const storePath = sessionApi.resolveStorePath(cfg.session?.store, {
           agentId,
         });
-        const raw = readFileSync(storePath, "utf8");
-        const store = JSON.parse(raw) as Record<string, { sessionId?: string } | undefined>;
+        const store = sessionApi.loadSessionStore(storePath) as Record<
+          string,
+          { sessionId?: string } | undefined
+        >;
         const sessionId = store[key]?.sessionId;
         return typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : undefined;
       } catch {
         return undefined;
       }
+    },
+    resolveSessionTranscriptFile: async ({ sessionId, sessionKey }) => {
+      const normalizedSessionId = sessionId.trim();
+      if (!normalizedSessionId) {
+        return undefined;
+      }
+
+      try {
+        const sessionApi = getRuntimeAgentSessionApi(api);
+        if (!sessionApi) {
+          return undefined;
+        }
+        const cfg = api.runtime.config.loadConfig();
+        const normalizedSessionKey = sessionKey?.trim();
+        const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
+        const agentId = normalizeAgentId(parsed?.agentId);
+        const storePath = sessionApi.resolveStorePath(cfg.session?.store, {
+          agentId,
+        });
+        const store = sessionApi.loadSessionStore(storePath) as Record<
+          string,
+          { sessionId?: string; sessionFile?: string } | undefined
+        >;
+        const entry =
+          (normalizedSessionKey ? store[normalizedSessionKey] : undefined)
+          ?? Object.values(store).find((candidate) => candidate?.sessionId === normalizedSessionId);
+        const transcriptPath = sessionApi.resolveSessionFilePath(
+          normalizedSessionId,
+          entry,
+          {
+            agentId,
+            storePath,
+          },
+        );
+        return transcriptPath.trim() || undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    listStartupSessionFileCandidates: async () => {
+      const sessionApi = getRuntimeAgentSessionApi(api);
+      if (!sessionApi) {
+        return [];
+      }
+
+      let cfg: unknown = registrationConfig.openClawConfig;
+      try {
+        cfg = api.runtime.config.loadConfig();
+      } catch {
+        // Fall back to the registration config snapshot when live config is unavailable.
+      }
+
+      const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
+      const storeConfig = getStringField(sessionConfig, "store");
+      const candidates: StartupSessionFileCandidate[] = [];
+      const seen = new Set<string>();
+
+      for (const agentId of listConfiguredAgentIds(cfg)) {
+        let storePath: string;
+        let store: Record<string, RuntimeSessionStoreEntry | undefined>;
+        try {
+          storePath = sessionApi.resolveStorePath(storeConfig, { agentId });
+          store = sessionApi.loadSessionStore(storePath);
+        } catch {
+          continue;
+        }
+
+        for (const [rawSessionKey, rawEntry] of Object.entries(store)) {
+          const sessionKey = rawSessionKey.trim();
+          if (!sessionKey || !isRecord(rawEntry)) {
+            continue;
+          }
+          const parsed = parseAgentSessionKey(sessionKey);
+          if (parsed?.agentId && normalizeAgentId(parsed.agentId) !== agentId) {
+            continue;
+          }
+          const sessionId = getStringField(rawEntry, "sessionId");
+          if (!sessionId) {
+            continue;
+          }
+
+          let sessionFile: string;
+          try {
+            sessionFile = sessionApi.resolveSessionFilePath(sessionId, rawEntry, {
+              agentId,
+              storePath,
+            }).trim();
+          } catch {
+            continue;
+          }
+          if (!sessionFile) {
+            continue;
+          }
+
+          const dedupeKey = `${sessionId}\0${sessionKey}\0${sessionFile}`;
+          if (seen.has(dedupeKey)) {
+            continue;
+          }
+          seen.add(dedupeKey);
+          candidates.push({
+            sessionId,
+            sessionKey,
+            sessionFile,
+            agentId,
+            storePath,
+          });
+        }
+      }
+
+      return candidates;
     },
     agentLaneSubagent: "subagent",
     log,
@@ -1794,7 +2363,6 @@ function wirePluginHandlers(
   });
 
   api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
-  api.registerContextEngine("default", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
   api.registerTool((ctx) =>
     createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
@@ -1815,7 +2383,12 @@ function wirePluginHandlers(
   );
 
   api.registerCommand(
-    createLcmCommand({ db: shared.waitForDatabase, config: deps.config, deps }),
+    createLcmCommand({
+      db: shared.waitForDatabase,
+      config: deps.config,
+      deps,
+      getLcm: shared.waitForEngine,
+    }),
   );
 }
 
@@ -1831,12 +2404,13 @@ const lcmPlugin = {
         value && typeof value === "object" && !Array.isArray(value)
           ? (value as Record<string, unknown>)
           : {};
-      return resolveLcmConfig(process.env, raw);
+      return resolveLcmConfigWithDiagnostics(process.env, raw).config;
     },
   },
 
   register(api: OpenClawPluginApi) {
-    const deps = createLcmDependencies(api);
+    const registrationConfig = resolveRegistrationConfig(api);
+    const deps = createLcmDependencies(api, registrationConfig);
     const dbPath = deps.config.databasePath;
     const normalizedDbPath = normalizePath(dbPath);
 
@@ -1865,6 +2439,15 @@ const lcmPlugin = {
       return error instanceof Error ? error : new Error(String(error));
     }
 
+    /** Start the non-blocking startup scan for oversized LCM-managed transcripts. */
+    function scheduleStartupAutoRotate(nextEngine: LcmContextEngine): void {
+      void nextEngine.autoRotateManagedSessionFilesAtStartup().catch((error) => {
+        deps.log.warn(
+          `[lcm] auto-rotate: phase=startup action=warn durationMs=0 reason=startup-scan-failed error=${describeLogError(error).replace(/\s+/g, "_")}`,
+        );
+      });
+    }
+
     /** Build a live DB+engine pair and roll back the DB handle if engine init fails. */
     function initializeEngine(): LcmContextEngine {
       const startedAt = Date.now();
@@ -1877,6 +2460,7 @@ const lcmPlugin = {
         deps.log.info(
           `[lcm] Engine initialized for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms`,
         );
+        scheduleStartupAutoRotate(nextEngine);
         return nextEngine;
       } catch (error) {
         closeLcmConnection(nextDatabase);
@@ -2013,14 +2597,19 @@ const lcmPlugin = {
     logStartupBannerOnce({
       key: "plugin-loaded",
       log: (message) => deps.log.info(message),
-      message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+      message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold}, proactiveThresholdCompactionMode=${deps.config.proactiveThresholdCompactionMode})`,
+    });
+    logStartupBannerOnce({
+      key: "state-dir",
+      log: (message) => deps.log.info(message),
+      message: `[lcm] State dir: ${resolveOpenclawStateDir(process.env)}`,
     });
     logStartupBannerOnce({
       key: "compaction-model",
       log: (message) => deps.log.info(message),
       message: buildCompactionModelLog({
         config: deps.config,
-        openClawConfig: api.config,
+        openClawConfig: registrationConfig.openClawConfig,
         defaultProvider: process.env.OPENCLAW_PROVIDER?.trim() ?? "",
       }),
     });

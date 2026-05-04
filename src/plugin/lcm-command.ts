@@ -1,11 +1,15 @@
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
+import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
+import type { RotateSessionStorageWithBackupResult } from "../engine.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
-import type { OpenClawPluginCommandDefinition, PluginCommandContext } from "openclaw/plugin-sdk";
+import type { OpenClawPluginCommandDefinition, PluginCommandContext } from "../openclaw-bridge.js";
 import { applyScopedDoctorRepair } from "./lcm-doctor-apply.js";
+import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
+import { describeLogError } from "../lcm-log.js";
 import {
   applyDoctorCleaners,
   getDoctorCleanerApplyUnavailableReason,
@@ -18,9 +22,15 @@ import {
   getDoctorSummaryStats,
   type DoctorSummaryStats,
 } from "./lcm-doctor-shared.js";
+import {
+  CompactionMaintenanceStore,
+  type ConversationCompactionMaintenanceRecord,
+} from "../store/compaction-maintenance-store.js";
+import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
+const ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
 type LcmStatusStats = {
   conversationCount: number;
@@ -58,9 +68,20 @@ type CurrentConversationResolution =
 
 type ParsedLcmCommand =
   | { kind: "status" }
+  | { kind: "backup" }
+  | { kind: "rotate" }
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "help"; error?: string };
+
+type RotateCommandEngine = {
+  rotateSessionStorageWithBackup(params: {
+    sessionId?: string;
+    sessionKey?: string;
+    sessionFile: string;
+    lockTimeoutMs: number;
+  }): Promise<RotateSessionStorageWithBackupResult>;
+};
 
 const DOCTOR_CLEANER_IDS = new Set<DoctorCleanerId>(getDoctorCleanerFilterIds());
 
@@ -113,6 +134,11 @@ function buildSection(title: string, lines: string[]): string {
 
 function buildStatLine(label: string, value: string): string {
   return `${label}: ${value}`;
+}
+
+function formatFailureReason(error: unknown): string {
+  const message = describeLogError(error).trim();
+  return message || "Unknown error";
 }
 
 function formatCompressionRatio(contextTokens: number, compressedTokens: number): string {
@@ -186,6 +212,14 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "status" }
         : { kind: "help", error: "`/lcm status` does not accept extra arguments." };
+    case "backup":
+      return rest.length === 0
+        ? { kind: "backup" }
+        : { kind: "help", error: "`/lcm backup` does not accept extra arguments." };
+    case "rotate":
+      return rest.length === 0
+        ? { kind: "rotate" }
+        : { kind: "help", error: "`/lcm rotate` does not accept extra arguments." };
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -217,7 +251,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -342,7 +376,13 @@ function getConversationStatusBySessionKey(
   sessionKey: string,
 ): LcmConversationStatusStats | null {
   const row = db
-    .prepare(`SELECT conversation_id FROM conversations WHERE session_key = ? LIMIT 1`)
+    .prepare(
+      `SELECT conversation_id
+       FROM conversations
+       WHERE session_key = ?
+       ORDER BY active DESC, created_at DESC
+       LIMIT 1`,
+    )
     .get(sessionKey) as { conversation_id: number } | undefined;
 
   if (!row) {
@@ -361,7 +401,7 @@ function getConversationStatusBySessionId(
       `SELECT conversation_id
        FROM conversations
        WHERE session_id = ?
-       ORDER BY created_at DESC
+       ORDER BY active DESC, created_at DESC
        LIMIT 1`,
     )
     .get(sessionId) as { conversation_id: number } | undefined;
@@ -371,6 +411,22 @@ function getConversationStatusBySessionId(
   }
 
   return getConversationStatusStats(db, row.conversation_id);
+}
+
+async function getConversationCompactionMaintenanceByConversationId(
+  db: DatabaseSync,
+  conversationId: number,
+): Promise<ConversationCompactionMaintenanceRecord | null> {
+  return await new CompactionMaintenanceStore(db).getConversationCompactionMaintenance(
+    conversationId,
+  );
+}
+
+async function getConversationCompactionTelemetryByConversationId(
+  db: DatabaseSync,
+  conversationId: number,
+) {
+  return await new CompactionTelemetryStore(db).getConversationCompactionTelemetry(conversationId);
 }
 
 async function resolveCurrentConversation(params: {
@@ -430,6 +486,29 @@ async function resolveCurrentConversation(params: {
   };
 }
 
+async function resolveRotateSessionId(params: {
+  ctx: PluginCommandContext;
+  deps: LcmDependencies;
+  current: Extract<CurrentConversationResolution, { kind: "resolved" }>;
+}): Promise<string | undefined> {
+  const directSessionId = normalizeIdentity(params.ctx.sessionId);
+  if (directSessionId) {
+    return directSessionId;
+  }
+
+  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
+  if (sessionKey) {
+    const runtimeSessionId = normalizeIdentity(
+      await params.deps.resolveSessionIdFromSessionKey(sessionKey),
+    );
+    if (runtimeSessionId) {
+      return runtimeSessionId;
+    }
+  }
+
+  return normalizeIdentity(params.current.stats.sessionId);
+}
+
 function resolvePluginEnabled(config: unknown): boolean {
   const root = asRecord(config);
   const plugins = asRecord(root?.plugins);
@@ -450,10 +529,11 @@ function resolveContextEngineSlot(config: unknown): string {
 
 function resolvePluginSelected(config: unknown): boolean {
   const slot = resolveContextEngineSlot(config);
-  return slot === "" || slot === "lossless-claw" || slot === "default";
+  return slot === "" || slot === "lossless-claw";
 }
 
 function resolveDbSizeLabel(dbPath: string): string {
+  if (typeof dbPath !== "string") return "unknown";
   const trimmed = dbPath.trim();
   if (!trimmed || trimmed === ":memory:" || trimmed.startsWith("file::memory:")) {
     return "in-memory";
@@ -472,7 +552,18 @@ function buildHelpText(error?: string): string {
     "",
     buildSection("📘 Commands", [
       buildStatLine(formatCommand(VISIBLE_COMMAND), "Show compact status output."),
-      buildStatLine(formatCommand(`${VISIBLE_COMMAND} status`), "Show plugin, Global, and current-conversation status."),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} status`),
+        "Show plugin, Global, current-conversation, and compaction-maintenance status.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} backup`),
+        "Create a timestamped backup of the current LCM database.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} rotate`),
+        "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
+      ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor clean`),
@@ -489,6 +580,8 @@ function buildHelpText(error?: string): string {
       buildStatLine("subcommands", `Discover them with ${formatCommand(`${VISIBLE_COMMAND} help`)}.`),
       buildStatLine("alias", `${formatCommand(HIDDEN_ALIAS)} is accepted as a shorter alias.`),
       buildStatLine("current conversation", "Uses the active LCM session when the host exposes session identity."),
+      buildStatLine("`/new`", "Prunes context for the current LCM conversation. It does not split storage."),
+      buildStatLine("`/reset`", "Resets OpenClaw session flow. Use rotate when you only want transcript compaction."),
     ]),
   ];
   return lines.join("\n");
@@ -551,6 +644,16 @@ async function buildStatusText(params: {
         truncated: 0,
         fallback: 0,
       };
+    const maintenance = await getConversationCompactionMaintenanceByConversationId(
+      params.db,
+      current.stats.conversationId,
+    );
+    const telemetry = await getConversationCompactionTelemetryByConversationId(
+      params.db,
+      current.stats.conversationId,
+    );
+    const formatMaintenanceTime = (value: Date | null): string =>
+      value ? formatTimestamp(value, params.config.timezone) : "never";
     lines.push(
       buildSection("📍 Current conversation", [
         buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
@@ -576,6 +679,37 @@ async function buildStatusText(params: {
             ? `${formatNumber(conversationDoctor.total)} issue(s) in this conversation`
             : "clean",
         ),
+      ]),
+    );
+    lines.push(
+      "",
+      buildSection("🛠️ Maintenance", [
+        buildStatLine(
+          "state",
+          maintenance?.pending
+            ? "pending"
+            : maintenance?.running
+              ? "running"
+              : "idle",
+        ),
+        buildStatLine("requested at", formatMaintenanceTime(maintenance?.requestedAt ?? null)),
+        buildStatLine("reason", maintenance?.reason ?? "none"),
+        buildStatLine("last started", formatMaintenanceTime(maintenance?.lastStartedAt ?? null)),
+        buildStatLine("last finished", formatMaintenanceTime(maintenance?.lastFinishedAt ?? null)),
+        buildStatLine("last failure", maintenance?.lastFailureSummary ?? "none"),
+        buildStatLine(
+          "requested token budget",
+          maintenance?.tokenBudget != null ? formatNumber(maintenance.tokenBudget) : "unknown",
+        ),
+        buildStatLine(
+          "observed token count",
+          maintenance?.currentTokenCount != null ? formatNumber(maintenance.currentTokenCount) : "unknown",
+        ),
+        buildStatLine("last api call", formatMaintenanceTime(telemetry?.lastApiCallAt ?? null)),
+        buildStatLine("last cache touch", formatMaintenanceTime(telemetry?.lastCacheTouchAt ?? null)),
+        buildStatLine("cache retention", telemetry?.retention ?? "unknown"),
+        buildStatLine("cache state", telemetry?.cacheState ?? "unknown"),
+        buildStatLine("provider/model", [telemetry?.provider, telemetry?.model].filter(Boolean).join(" / ") || "unknown"),
       ]),
     );
   } else {
@@ -730,6 +864,275 @@ function runQuickCheck(db: DatabaseSync): string {
 
 function isPassingQuickCheck(result: string): boolean {
   return result === "ok";
+}
+
+function getLcmBackupUnavailableReason(databasePath: string): string | null {
+  if (typeof databasePath !== "string") return "Invalid database path.";
+  const trimmed = databasePath.trim();
+  if (!trimmed || trimmed === ":memory:" || trimmed.startsWith("file::memory:")) {
+    return "Backup requires a file-backed SQLite database.";
+  }
+  return null;
+}
+
+async function buildBackupText(params: {
+  db: DatabaseSync;
+  config: LcmConfig;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "💾 Lossless Claw Backup",
+    "",
+  ];
+
+  const unavailableReason = getLcmBackupUnavailableReason(params.config.databasePath);
+  if (unavailableReason) {
+    lines.push(
+      buildSection("🛠️ Backup", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", unavailableReason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  let backupPath: string | null;
+  try {
+    backupPath = createLcmDatabaseBackup(params.db, {
+      databasePath: params.config.databasePath,
+      label: "backup",
+    });
+  } catch (error) {
+    lines.push(
+      buildSection("🛠️ Backup", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(error)),
+      ]),
+    );
+    return lines.join("\n");
+  }
+  if (!backupPath) {
+    lines.push(
+      buildSection("🛠️ Backup", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "Lossless Claw could not determine a backup path."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("🛠️ Backup", [
+      buildStatLine("status", "created"),
+      buildStatLine("db path", params.config.databasePath),
+      buildStatLine("backup path", backupPath),
+    ]),
+  );
+  return lines.join("\n");
+}
+
+async function buildRotateText(params: {
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+  config: LcmConfig;
+  deps?: LcmDependencies;
+  getLcm?: () => Promise<RotateCommandEngine>;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🪓 Lossless Claw Rotate",
+    "",
+  ];
+
+  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
+  if (!sessionKey) {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine(
+          "reason",
+          "OpenClaw must expose the active session key for Lossless Claw to rotate storage safely.",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const current = await resolveCurrentConversation({
+    ctx: params.ctx,
+    db: params.db,
+  });
+  if (current.kind === "unavailable") {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", current.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (!params.deps || !params.getLcm) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "Rotate requires the runtime-backed LCM engine to be available."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const sessionId = await resolveRotateSessionId({
+    ctx: params.ctx,
+    deps: params.deps,
+    current,
+  });
+  if (!sessionId) {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
+        buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
+        buildStatLine("messages", formatNumber(current.stats.messageCount)),
+      ]),
+      "",
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine(
+          "reason",
+          "Lossless Claw resolved the active conversation, but OpenClaw did not expose or resolve a runtime session id, so rotate cannot locate the live transcript safely.",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const transcriptPath = await params.deps.resolveSessionTranscriptFile({
+    sessionId,
+    sessionKey,
+  });
+  if (!transcriptPath || !existsSync(transcriptPath)) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine(
+          "reason",
+          "Lossless Claw could not resolve the active session transcript path, so it cannot rotate the transcript safely.",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const unavailableReason = getLcmBackupUnavailableReason(params.config.databasePath);
+  if (unavailableReason) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", unavailableReason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  let result: RotateSessionStorageWithBackupResult;
+  try {
+    result = await (await params.getLcm()).rotateSessionStorageWithBackup({
+      sessionId,
+      sessionKey,
+      sessionFile: transcriptPath,
+      lockTimeoutMs: ROTATE_DATABASE_LOCK_TIMEOUT_MS,
+    });
+  } catch (error) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(error)),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("📍 Current conversation", [
+      buildStatLine(
+        "conversation id",
+        formatNumber(result.currentConversationId ?? current.stats.conversationId),
+      ),
+      buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
+      buildStatLine(
+        "messages",
+        formatNumber(result.currentMessageCount ?? current.stats.messageCount),
+      ),
+    ]),
+    "",
+  );
+
+  if (result.kind === "backup_failed") {
+    lines.push(
+      buildSection("💾 Backup", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", result.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (result.kind === "unavailable" && !result.backupPath) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", result.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("💾 Backup", [
+      buildStatLine("status", "replaced latest"),
+      buildStatLine("backup path", result.backupPath!),
+    ]),
+    "",
+  );
+
+  if (result.kind === "rotate_failed") {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", result.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (result.kind === "unavailable") {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", result.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("🛠️ Rotate", [
+      buildStatLine("status", "rotated"),
+      buildStatLine("preserved tail messages", formatNumber(result.preservedTailMessageCount)),
+      buildStatLine("checkpoint bytes", formatNumber(result.checkpointSize)),
+      buildStatLine("bytes removed", formatNumber(result.bytesRemoved)),
+      buildStatLine("transcript", transcriptPath),
+      buildStatLine("mode", "preserved current conversation and rotated transcript tail"),
+    ]),
+    "",
+    buildSection("🧭 Notes", [
+      "Current LCM conversation, summaries, and context items remain in place.",
+      `${formatCommand("/new")} still prunes context only, and ${formatCommand("/reset")} still resets OpenClaw session flow.`,
+    ]),
+  );
+  return lines.join("\n");
 }
 
 async function buildDoctorCleanersApplyText(params: {
@@ -976,6 +1379,7 @@ export function createLcmCommand(params: {
   config: LcmConfig;
   deps?: LcmDependencies;
   summarize?: LcmSummarizeFn;
+  getLcm?: () => Promise<RotateCommandEngine>;
 }): OpenClawPluginCommandDefinition {
   const getDb = async (): Promise<DatabaseSync> =>
     typeof params.db === "function" ? await params.db() : params.db;
@@ -989,13 +1393,30 @@ export function createLcmCommand(params: {
       telegram: "Lossless Claw is working...",
     },
     description:
-      "Show Lossless Claw health, scan broken summaries, inspect high-confidence junk candidates, and run scoped doctor actions.",
+      "Show Lossless Claw health, create DB backups, compact the current session transcript while preserving LCM context, inspect high-confidence junk candidates, and run scoped doctor actions.",
     acceptsArgs: true,
     handler: async (ctx) => {
       const parsed = parseLcmCommand(ctx.args);
       switch (parsed.kind) {
         case "status":
           return { text: await buildStatusText({ ctx, db: await getDb(), config: params.config }) };
+        case "backup":
+          return {
+            text: await buildBackupText({
+              db: await getDb(),
+              config: params.config,
+            }),
+          };
+        case "rotate":
+          return {
+            text: await buildRotateText({
+              ctx,
+              db: await getDb(),
+              config: params.config,
+              deps: params.deps,
+              getLcm: params.getLcm,
+            }),
+          };
         case "doctor":
           return parsed.apply
             ? {

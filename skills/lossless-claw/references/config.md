@@ -43,6 +43,35 @@ Good starting range:
 
 - `32` to `64`
 
+### `freshTailMaxTokens`
+
+Optional token cap for the protected fresh tail.
+
+Why it matters:
+
+- Prevents a few huge tool results from making the "fresh" suffix effectively uncompactable.
+- Still preserves the newest message even if that single message exceeds the cap.
+
+Good starting range:
+
+- Leave unset unless large tool outputs are forcing avoidable cost or overflow.
+- Start around `12000` to `32000` when you want a softer, size-aware fresh tail.
+
+### `promptAwareEviction`
+
+Controls whether budget-constrained assembly keeps older context by prompt relevance or pure chronology.
+
+Why it matters:
+
+- when enabled, lossless-claw can keep an older but on-topic summary instead of a newer irrelevant one
+- this can improve retrieval quality when the assembled context is tight
+- it also makes the preserved prompt prefix less stable, which can reduce prefix-based prompt-cache hit rates
+
+Good default:
+
+- `false`
+- enable it only when topical older-context recall under tight budgets matters more than prompt-cache stability
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.
@@ -73,12 +102,15 @@ Good defaults:
 - `maxColdCacheCatchupPasses: 2`
 - `hotCachePressureFactor: 4`
 - `hotCacheBudgetHeadroomRatio: 0.2`
+- `coldCacheObservationThreshold: 3`
+- `criticalBudgetPressureRatio: 0.70`
 
 Operationally:
 
 - hot cache stretches the incremental leaf trigger to `dynamicLeafChunkTokens.max`
 - hot cache skips incremental maintenance entirely when the assembled context is comfortably below the real token budget
 - hot cache gets a short hysteresis window so a recent cache hit stays "hot" briefly unless telemetry shows a break
+- critical token-budget pressure bypasses hot-cache delay once the live prompt reaches `criticalBudgetPressureRatio * tokenBudget`
 - if hot-cache maintenance still runs, it stays leaf-only and suppresses follow-on condensed passes
 
 ### `dynamicLeafChunkTokens`
@@ -154,6 +186,7 @@ Why it matters:
 
 - useful for custom deployments, testing, or isolating environments
 - wrong path selection is a common reason operators think LCM is empty or not growing
+- the default resolves to `${OPENCLAW_STATE_DIR}/lcm.db` (falls back to `~/.openclaw/lcm.db`)
 
 ### `databasePath`
 
@@ -164,6 +197,14 @@ Why it matters:
 - this is the documented key new config should use
 - `dbPath` is still accepted for compatibility
 
+### `largeFilesDir`
+
+Directory for persisting large-file text payloads externalised from the transcript.
+
+Why it matters:
+
+- defaults to `${OPENCLAW_STATE_DIR}/lcm-files`; on multi-profile hosts each profile stores files in its own state directory automatically
+- override with `LCM_LARGE_FILES_DIR` or set `largeFilesDir` in plugin config when you want an explicit path
 ### `largeFileThresholdTokens`
 
 Threshold for externalizing oversized tool/file payloads out of the main transcript into large-file storage.
@@ -172,6 +213,53 @@ Why it matters:
 
 - lower values externalize more aggressively
 - higher values keep more payload inline but can bloat storage and compaction inputs
+
+### `transcriptGcEnabled`
+
+Controls whether `maintain()` rewrites transcript entries for already-externalized tool results.
+
+Why it matters:
+
+- keep this off unless you want transcript GC to mutate the live session file during maintenance
+- the default is `false`
+
+### `proactiveThresholdCompactionMode`
+
+Controls whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior.
+
+Why it matters:
+
+- `deferred` is the default and avoids foreground turn stalls by recording one coalesced maintenance row per conversation
+- `deferred` also stores provider/model/cache telemetry so Anthropic-family sessions can avoid rewriting a still-hot prompt cache
+- `inline` preserves the legacy foreground compaction path for hosts that do not yet support deferred execution
+- `/lossless status` and `/lcm status` surface pending/running/last-failure maintenance state so operators can see when compaction is queued
+- background `maintain()` can still do non-prompt-mutating work, but prompt-mutating debt is consumed pre-assembly once cache is cold or the next turn is already approaching overflow
+
+### `autoRotateSessionFiles`
+
+Automatically rotates oversized LCM-managed session JSONL files.
+
+Defaults:
+
+- `enabled: true`
+- `sizeBytes: 2097152`
+- `startup: "rotate"`
+- `runtime: "rotate"`
+
+Why it matters:
+
+- prevents very large OpenClaw session JSONL files from choking fallback/gateway startup while LCM owns the durable context
+- runtime rotation uses the same backup-backed safe path as `/lossless rotate` / `/lcm rotate`
+- startup scans OpenClaw's current indexed session stores for configured agents, intersects those candidates with active LCM bootstrap state, and creates one pre-rotation DB backup for the startup batch
+- only runs for active, writable LCM conversations; ignored sessions, stateless sessions, sessions outside the indexed startup candidate set, and sessions without active LCM state are skipped
+- the preserved transcript tail follows the normal rotate behavior controlled by `freshTailCount`
+
+Operational logging:
+
+- every decision is logged with the prefix `[lcm] auto-rotate:`
+- startup emits one compact `action=summary` line with `scanned`, `eligible`, `rotated`, `warned`, `skipped`, `durationMs`, and `bytesRemoved`
+- rotate logs include `phase`, `action`, `sessionId`, `sessionKey`, `sessionFile`, `sizeBytes`, `thresholdBytes`, `durationMs`, `backupPath`, `bytesRemoved`, `preservedTailMessageCount`, and `checkpointSize`
+- real warning logs include the same available context plus `reason` or `error`; quiet startup skips such as missing files, missing bootstrap mappings, and below-threshold files are counted in the summary instead of logged per candidate
 
 ## Compaction timing and shape
 
@@ -182,6 +270,25 @@ See high-impact settings above.
 ### `freshTailCount`
 
 See high-impact settings above.
+
+### `freshTailMaxTokens`
+
+See high-impact settings above.
+
+### `promptAwareEviction`
+
+Boolean toggle for prompt-sensitive selection inside the evictable prefix during assembly.
+
+Why it matters:
+
+- only applies when the older evictable prefix does not fit the token budget
+- the protected fresh tail is unaffected
+- `true` keeps the most relevant older items for the current prompt
+- `false` falls back to pure chronological retention for the older prefix
+
+Env override:
+
+- `LCM_PROMPT_AWARE_EVICTION_ENABLED`
 
 ### `leafChunkTokens`
 
@@ -293,6 +400,19 @@ Why it matters:
 
 Defers incremental leaf compaction more aggressively when prompt-cache telemetry indicates a hot cache.
 
+#### `cacheAwareCompaction.cacheTTLSeconds`
+
+Fallback cache TTL used when deferred Anthropic compaction has provider/model telemetry but no explicit runtime cache-retention window.
+
+Why it matters:
+
+- lets cache-safe deferred compaction stay conservative even when the host only knows that the turn was Anthropic-family, not the exact retention tier
+- keeps prompt-mutating debt pending until the cached prefix is likely cold
+
+Default:
+
+- `300`
+
 #### `cacheAwareCompaction.maxColdCacheCatchupPasses`
 
 Maximum bounded catch-up passes allowed in one maintenance cycle when cache telemetry is cold.
@@ -322,6 +442,37 @@ Why it matters:
 Default:
 
 - `0.2`
+
+#### `cacheAwareCompaction.coldCacheObservationThreshold`
+
+Consecutive cold observations required before non-explicit cache misses are treated as truly cold.
+
+Why it matters:
+
+- prevents a single OpenRouter routing miss or provider failover blip from immediately triggering cold-cache catch-up
+- explicit cache breaks still count as cold immediately
+
+Default:
+
+- `3`
+
+#### `cacheAwareCompaction.criticalBudgetPressureRatio`
+
+Fraction of the token budget at which deferred compaction bypasses hot-cache delay.
+
+Why it matters:
+
+- lets prompt-mutating deferred compaction run before the runtime falls back to emergency overflow handling
+- preserves cache-aware throttling below the pressure threshold
+- can be set to `1` to disable this pressure bypass
+
+Default:
+
+- `0.70`
+
+Env override:
+
+- `LCM_CRITICAL_BUDGET_PRESSURE_RATIO`
 
 ### `dynamicLeafChunkTokens`
 

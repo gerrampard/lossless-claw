@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
+import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
@@ -64,6 +65,7 @@ export type ContextItemRecord = {
 
 export type SummarySearchInput = {
   conversationId?: number;
+  conversationIds?: number[];
   query: string;
   mode: "regex" | "full_text";
   since?: Date;
@@ -77,6 +79,7 @@ export type SummarySearchResult = {
   conversationId: number;
   kind: SummaryKind;
   snippet: string;
+  /** Effective search timestamp: latest covered content when known, else row creation time. */
   createdAt: Date;
   rank?: number;
 };
@@ -174,6 +177,9 @@ interface SummarySearchRow {
   rank: number;
   created_at: string;
 }
+
+const SUMMARY_SEARCH_TIME_EXPR = "COALESCE(s.latest_at, s.created_at)";
+const SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED = "COALESCE(latest_at, created_at)";
 
 interface MaxOrdinalRow {
   max_ordinal: number;
@@ -1029,8 +1035,10 @@ export class SummaryStore {
               input.query,
               limit,
               input.conversationId,
+              input.conversationIds,
               input.since,
               input.before,
+              input.sort,
             );
             if (trigramResults.length > 0) {
               return trigramResults;
@@ -1043,6 +1051,7 @@ export class SummaryStore {
           input.query,
           limit,
           input.conversationId,
+          input.conversationIds,
           input.since,
           input.before,
         );
@@ -1053,6 +1062,7 @@ export class SummaryStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
             input.sort,
@@ -1062,40 +1072,59 @@ export class SummaryStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
           );
         }
       }
-      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
+      return this.searchLike(
+        input.query,
+        limit,
+        input.conversationId,
+        input.conversationIds,
+        input.since,
+        input.before,
+      );
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(
+      input.query,
+      limit,
+      input.conversationId,
+      input.conversationIds,
+      input.since,
+      input.before,
+    );
   }
 
   private searchFullText(
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
     sort?: SearchSort,
   ): SummarySearchResult[] {
     const where: string[] = ["summaries_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
-    if (conversationId != null) {
-      where.push("s.conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "s.conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
-      where.push("julianday(s.created_at) >= julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR}) >= julianday(?)`);
       args.push(since.toISOString());
     }
     if (before) {
-      where.push("julianday(s.created_at) < julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR}) < julianday(?)`);
       args.push(before.toISOString());
     }
     args.push(limit);
-    const orderBy = buildFtsOrderBy(sort, "s.created_at");
+    const orderBy = buildFtsOrderBy(sort, SUMMARY_SEARCH_TIME_EXPR);
 
     const sql = `SELECT
          summaries_fts.summary_id,
@@ -1103,7 +1132,7 @@ export class SummaryStore {
          s.kind,
          snippet(summaries_fts, 1, '', '', '...', 32) AS snippet,
          rank,
-         s.created_at
+         ${SUMMARY_SEARCH_TIME_EXPR} AS created_at
        FROM summaries_fts
        JOIN summaries s ON s.summary_id = summaries_fts.summary_id
        WHERE ${where.join(" AND ")}
@@ -1117,6 +1146,7 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1127,16 +1157,19 @@ export class SummaryStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
-      where.push("julianday(created_at) >= julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);
       args.push(since.toISOString());
     }
     if (before) {
-      where.push("julianday(created_at) < julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) < julianday(?)`);
       args.push(before.toISOString());
     }
     args.push(limit);
@@ -1146,10 +1179,11 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, descendant_token_count,
-                source_message_token_count, model, created_at
+                source_message_token_count, model,
+                ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} AS created_at
          FROM summaries
          ${whereClause}
-         ORDER BY created_at DESC
+         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC
          LIMIT ?`,
       )
       .all(...args) as unknown as SummaryRow[];
@@ -1203,8 +1237,10 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
+    sort?: SearchSort,
   ): SummarySearchResult[] {
     const cjkSegments = this.extractCjkSegments(query).filter((segment) => segment.length >= 3);
     if (cjkSegments.length === 0) {
@@ -1230,19 +1266,23 @@ export class SummaryStore {
       where.push("LOWER(s.content) LIKE ? ESCAPE '\\'");
       args.push(`%${this.escapeLikeTerm(token)}%`);
     }
-    if (conversationId != null) {
-      where.push("s.conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "s.conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
-      where.push("julianday(s.created_at) >= julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR}) >= julianday(?)`);
       args.push(since.toISOString());
     }
     if (before) {
-      where.push("julianday(s.created_at) < julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR}) < julianday(?)`);
       args.push(before.toISOString());
     }
     args.push(limit);
+    const orderBy = buildFtsOrderBy(sort, SUMMARY_SEARCH_TIME_EXPR);
 
     const sql = `SELECT
          f.summary_id,
@@ -1250,11 +1290,11 @@ export class SummaryStore {
          s.kind,
          snippet(summaries_fts_cjk, 1, '', '', '...', 32) AS snippet,
          rank,
-         s.created_at
+         ${SUMMARY_SEARCH_TIME_EXPR} AS created_at
        FROM summaries_fts_cjk f
        JOIN summaries s ON s.summary_id = f.summary_id
        WHERE ${where.join(" AND ")}
-       ORDER BY rank
+       ORDER BY ${orderBy}
        LIMIT ?`;
     const rows = this.db.prepare(sql).all(...args) as unknown as SummarySearchRow[];
     return rows.map(toSearchResult);
@@ -1270,6 +1310,7 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1304,16 +1345,19 @@ export class SummaryStore {
 
     const where: string[] = [...cjkClauses, ...latinClauses];
     const args: Array<string | number> = [...cjkArgs, ...latinArgs];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
-      where.push("julianday(created_at) >= julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);
       args.push(since.toISOString());
     }
     if (before) {
-      where.push("julianday(created_at) < julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) < julianday(?)`);
       args.push(before.toISOString());
     }
     args.push(limit);
@@ -1322,10 +1366,11 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, descendant_token_count,
-                source_message_token_count, model, created_at
+                source_message_token_count, model,
+                ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} AS created_at
          FROM summaries
          WHERE ${where.join(" AND ")}
-         ORDER BY created_at DESC
+         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC
          LIMIT ?`,
       )
       .all(...args) as unknown as SummaryRow[];
@@ -1345,6 +1390,7 @@ export class SummaryStore {
     pattern: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1361,16 +1407,19 @@ export class SummaryStore {
 
     const where: string[] = [];
     const args: Array<string | number> = [];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
-      where.push("julianday(created_at) >= julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);
       args.push(since.toISOString());
     }
     if (before) {
-      where.push("julianday(created_at) < julianday(?)");
+      where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) < julianday(?)`);
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
@@ -1378,10 +1427,11 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, descendant_token_count,
-                source_message_token_count, model, created_at
+                source_message_token_count, model,
+                ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} AS created_at
          FROM summaries
          ${whereClause}
-         ORDER BY created_at DESC`,
+         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC`,
       )
       .all(...args) as unknown as SummaryRow[];
 

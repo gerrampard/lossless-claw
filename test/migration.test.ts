@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import * as features from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
+import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 
 const tempDirs: string[] = [];
 
@@ -15,6 +16,92 @@ afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/** Create an isolated file-backed database for migration tests. */
+function createTestDb(fileName: string) {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+  tempDirs.push(tempDir);
+  const dbPath = join(tempDir, fileName);
+  return getLcmConnection(dbPath);
+}
+
+/**
+ * Seed a pre-depth/pre-metadata summaries schema so startup migrations have
+ * real legacy rows to backfill.
+ */
+function seedLegacySummaryGraph(db: ReturnType<typeof getLcmConnection>): void {
+  db.exec(`
+    CREATE TABLE conversations (
+      conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      title TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE summaries (
+      summary_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      file_ids TEXT NOT NULL DEFAULT '[]'
+    );
+
+    CREATE TABLE messages (
+      message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      seq INTEGER NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (conversation_id, seq)
+    );
+
+    CREATE TABLE summary_messages (
+      summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL,
+      PRIMARY KEY (summary_id, message_id)
+    );
+
+    CREATE TABLE summary_parents (
+      summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      parent_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL,
+      PRIMARY KEY (summary_id, parent_summary_id)
+    );
+  `);
+
+  db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+    1,
+    "legacy-session",
+  );
+
+  db.prepare(
+    `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, created_at, file_ids)
+     VALUES (?, ?, ?, ?, ?, ?, '[]')`,
+  ).run("sum-leaf", 1, "leaf", "leaf", 10, "2026-01-01 09:00:00");
+  db.prepare(
+    `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, created_at, file_ids)
+     VALUES (?, ?, ?, ?, ?, ?, '[]')`,
+  ).run("sum-condensed", 1, "condensed", "condensed", 20, "2026-01-01 10:00:00");
+
+  db.prepare(
+    `INSERT INTO messages (message_id, conversation_id, seq, role, content, token_count, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(1, 1, 1, "user", "hello", 4, "2026-01-01 08:00:00");
+  db.prepare(
+    `INSERT INTO summary_messages (summary_id, message_id, ordinal)
+     VALUES (?, ?, ?)`,
+  ).run("sum-leaf", 1, 0);
+  db.prepare(
+    `INSERT INTO summary_parents (summary_id, parent_summary_id, ordinal)
+     VALUES (?, ?, ?)`,
+  ).run("sum-condensed", "sum-leaf", 0);
+}
 
 describe("runLcmMigrations summary depth backfill", () => {
   it("adds depth and metadata from summary lineage", () => {
@@ -125,6 +212,19 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(summaryColumns.some((column) => column.name === "descendant_count")).toBe(true);
     expect(summaryColumns.some((column) => column.name === "descendant_token_count")).toBe(true);
     expect(summaryColumns.some((column) => column.name === "source_message_token_count")).toBe(true);
+
+    const migrationStateRows = db
+      .prepare(
+        `SELECT step_name, algorithm_version
+         FROM lcm_migration_state
+         ORDER BY step_name`,
+      )
+      .all() as Array<{ step_name: string; algorithm_version: number }>;
+    expect(migrationStateRows).toEqual([
+      { step_name: "backfillSummaryDepths", algorithm_version: 1 },
+      { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
+      { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+    ]);
 
     const depthRows = db
       .prepare(
@@ -266,8 +366,29 @@ describe("runLcmMigrations summary depth backfill", () => {
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`)
       .all() as Array<{ name: string }>;
     const allIndexNames = new Set(allIndexRows.map((r) => r.name));
+    expect(allIndexNames.has("conversations_session_id_active_created_idx")).toBe(true);
     expect(allIndexNames.has("summary_messages_message_idx")).toBe(true);
     expect(allIndexNames.has("summaries_conv_depth_kind_idx")).toBe(true);
+
+    const queryPlanRows = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
+         FROM conversations
+         WHERE session_id = ?
+         ORDER BY active DESC, created_at DESC
+         LIMIT 1`,
+      )
+      .all("legacy-session") as Array<{
+      detail: string;
+    }>;
+    const queryPlanDetails = queryPlanRows.map((row) => row.detail);
+    expect(
+      queryPlanDetails.some((detail) =>
+        detail.includes("USING INDEX conversations_session_id_active_created_idx"),
+      ),
+    ).toBe(true);
+    expect(queryPlanDetails.some((detail) => detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
 
     db.prepare(
       `INSERT INTO conversations (session_id, session_key, active, archived_at)
@@ -279,6 +400,120 @@ describe("runLcmMigrations summary depth backfill", () => {
         .prepare(`INSERT INTO conversations (session_id, session_key, active) VALUES (?, ?, 1)`)
         .run("duplicate-active-session", "agent:main:main"),
     ).toThrow();
+  });
+
+  it("backfills message identity hashes and indexes conversation hash lookups", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "identity-hash.db");
+    const db = getLcmConnection(dbPath);
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE messages (
+        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, seq)
+      );
+    `);
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "identity-hash-session",
+    );
+    db.prepare(
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(1, 1, "assistant", "hello from hash backfill", 5);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as Array<{
+      name?: string;
+    }>;
+    expect(messageColumns.some((column) => column.name === "identity_hash")).toBe(true);
+
+    const row = db
+      .prepare(`SELECT identity_hash FROM messages WHERE conversation_id = ? AND seq = ?`)
+      .get(1, 1) as { identity_hash: string | null };
+    expect(row.identity_hash).toBe(
+      buildMessageIdentityHash("assistant", "hello from hash backfill"),
+    );
+
+    const indexes = db.prepare(`PRAGMA index_list(messages)`).all() as Array<{
+      name?: string;
+    }>;
+    expect(indexes.some((index) => index.name === "messages_conv_identity_hash_idx")).toBe(true);
+
+    const indexColumns = db
+      .prepare(`PRAGMA index_info(messages_conv_identity_hash_idx)`)
+      .all() as Array<{ name?: string }>;
+    expect(indexColumns.map((column) => column.name)).toEqual([
+      "conversation_id",
+      "identity_hash",
+    ]);
+  });
+
+  it("backfills message identity hashes across multiple batches", () => {
+    const db = createTestDb("identity-hash-batches.db");
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE messages (
+        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, seq)
+      );
+    `);
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "identity-hash-batch-session",
+    );
+
+    const insertMessage = db.prepare(
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    for (let index = 0; index < 1_205; index += 1) {
+      insertMessage.run(1, index, "assistant", `batch message ${index}`, 3);
+    }
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const unhashedCount = db
+      .prepare(`SELECT COUNT(*) AS count FROM messages WHERE identity_hash IS NULL OR identity_hash = ''`)
+      .get() as { count: number };
+    expect(unhashedCount.count).toBe(0);
+
+    const sampledRow = db
+      .prepare(`SELECT identity_hash FROM messages WHERE conversation_id = ? AND seq = ?`)
+      .get(1, 1_204) as { identity_hash: string | null };
+    expect(sampledRow.identity_hash).toBe(buildMessageIdentityHash("assistant", "batch message 1204"));
   });
 
   it("skips FTS tables when fts5 is unavailable", () => {
@@ -568,18 +803,162 @@ describe("runLcmMigrations summary depth backfill", () => {
     ]);
   });
 
+  it("creates message_parts when the bulk schema create did not", () => {
+    const db = createTestDb("missing-message-parts.db");
+    let skippedBulkMessagePartsCreate = false;
+
+    const instrumentedDb = {
+      prepare(sql: string) {
+        return db.prepare(sql);
+      },
+      exec(sql: string) {
+        const isInitialSchemaCreate =
+          !skippedBulkMessagePartsCreate &&
+          sql.includes("CREATE TABLE IF NOT EXISTS message_parts") &&
+          sql.includes("CREATE TABLE IF NOT EXISTS lcm_migration_state");
+        if (!isInitialSchemaCreate) {
+          return db.exec(sql);
+        }
+
+        // Simulate the Node sqlite bulk-exec failure mode by letting the rest of
+        // the schema block run while omitting only the original message_parts DDL.
+        skippedBulkMessagePartsCreate = true;
+        const schemaWithoutMessageParts = sql
+          .replace(
+            /\n\s*CREATE TABLE IF NOT EXISTS message_parts \([\s\S]*?\n\s*\);\n\s*\n\s*CREATE TABLE IF NOT EXISTS summary_messages/,
+            "\n\n    CREATE TABLE IF NOT EXISTS summary_messages",
+          )
+          .replace(
+            /\n\s*CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts \(message_id\);/,
+            "",
+          )
+          .replace(
+            /\n\s*CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts \(part_type\);/,
+            "",
+          );
+        expect(schemaWithoutMessageParts).not.toContain(
+          "CREATE TABLE IF NOT EXISTS message_parts",
+        );
+        return db.exec(schemaWithoutMessageParts);
+      },
+    } as unknown as Parameters<typeof runLcmMigrations>[0];
+
+    runLcmMigrations(instrumentedDb, { fts5Available: false });
+
+    expect(skippedBulkMessagePartsCreate).toBe(true);
+    const tableRow = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'table' AND name = 'message_parts'`,
+      )
+      .get() as { name?: string } | undefined;
+    expect(tableRow?.name).toBe("message_parts");
+
+    const indexRows = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'index' AND name IN (?, ?)
+         ORDER BY name`,
+      )
+      .all("message_parts_message_idx", "message_parts_type_idx") as Array<{
+      name: string;
+    }>;
+    expect(indexRows.map((row) => row.name)).toEqual([
+      "message_parts_message_idx",
+      "message_parts_type_idx",
+    ]);
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "partial-schema-session",
+    );
+    db.prepare(
+      `INSERT INTO messages (message_id, conversation_id, seq, role, content, token_count)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(1, 1, 1, "assistant", "hello", 1);
+    db.prepare(
+      `INSERT INTO message_parts (part_id, message_id, session_id, part_type, ordinal, text_content)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("part-1", 1, "partial-schema-session", "text", 0, "hello");
+
+    const partRow = db
+      .prepare(`SELECT text_content FROM message_parts WHERE part_id = ?`)
+      .get("part-1") as { text_content?: string } | undefined;
+    expect(partRow?.text_content).toBe("hello");
+  });
+
   it("backfills legacy tool_call_id values from metadata.raw.call_id", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "legacy-tool-call-id.db");
     const db = getLcmConnection(dbPath);
 
-    runLcmMigrations(db, { fts5Available: false });
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
 
-    db.prepare(
-      `INSERT INTO conversations (conversation_id, session_id, title)
-       VALUES (?, ?, ?)`,
-    ).run(1, "legacy-session", "Legacy");
+      CREATE TABLE messages (
+        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, seq)
+      );
+
+      CREATE TABLE message_parts (
+        part_id TEXT PRIMARY KEY,
+        message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL,
+        part_type TEXT NOT NULL CHECK (part_type IN (
+          'text', 'reasoning', 'tool', 'patch', 'file',
+          'subtask', 'compaction', 'step_start', 'step_finish',
+          'snapshot', 'agent', 'retry'
+        )),
+        ordinal INTEGER NOT NULL,
+        text_content TEXT,
+        is_ignored INTEGER,
+        is_synthetic INTEGER,
+        tool_call_id TEXT,
+        tool_name TEXT,
+        tool_status TEXT,
+        tool_input TEXT,
+        tool_output TEXT,
+        tool_error TEXT,
+        tool_title TEXT,
+        patch_hash TEXT,
+        patch_files TEXT,
+        file_mime TEXT,
+        file_name TEXT,
+        file_url TEXT,
+        subtask_prompt TEXT,
+        subtask_desc TEXT,
+        subtask_agent TEXT,
+        step_reason TEXT,
+        step_cost REAL,
+        step_tokens_in INTEGER,
+        step_tokens_out INTEGER,
+        snapshot_hash TEXT,
+        compaction_auto INTEGER,
+        metadata TEXT,
+        UNIQUE (message_id, ordinal)
+      );
+    `);
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id, title) VALUES (?, ?, ?)`).run(
+      1,
+      "legacy-session",
+      "Legacy",
+    );
     db.prepare(
       `INSERT INTO messages (message_id, conversation_id, seq, role, content, token_count)
        VALUES (?, ?, ?, ?, ?, ?)`,
@@ -627,5 +1006,203 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(row.tool_call_id).toBe("fc_legacy_123");
     expect(row.tool_name).toBe("bash");
     expect(row.tool_input).toBe('{"cmd":"pwd"}');
+  });
+
+  it("skips completed backfills on repeat startup", () => {
+    const db = createTestDb("repeat-startup.db");
+    runLcmMigrations(db, { fts5Available: false });
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id, title) VALUES (?, ?, ?)`).run(
+      1,
+      "repeat-session",
+      "Repeat",
+    );
+    db.prepare(
+      `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, file_ids)
+       VALUES (?, ?, ?, ?, ?, '[]')`,
+    ).run("sum-leaf", 1, "leaf", "leaf", 5);
+    db.prepare(
+      `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, file_ids)
+       VALUES (?, ?, ?, ?, ?, '[]')`,
+    ).run("sum-condensed", 1, "condensed", "condensed", 10);
+    db.prepare(
+      `INSERT INTO summary_parents (summary_id, parent_summary_id, ordinal)
+       VALUES (?, ?, ?)`,
+    ).run("sum-condensed", "sum-leaf", 0);
+
+    db.prepare(
+      `INSERT INTO messages (message_id, conversation_id, seq, role, content, token_count)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(1, 1, 1, "assistant", "", 0);
+    db.prepare(
+      `INSERT INTO message_parts (
+         part_id, message_id, session_id, part_type, ordinal, text_content,
+         tool_call_id, tool_name, tool_input, tool_output, metadata
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "part-1",
+      1,
+      "repeat-session",
+      "text",
+      0,
+      null,
+      null,
+      null,
+      null,
+      null,
+      JSON.stringify({
+        rawType: "function_call",
+        raw: {
+          call_id: "fc_repeat_123",
+          name: "bash",
+          arguments: { cmd: "pwd" },
+        },
+      }),
+    );
+
+    const logMessages: string[] = [];
+    runLcmMigrations(db, {
+      fts5Available: false,
+      log: {
+        info(message) {
+          logMessages.push(message);
+        },
+      },
+    });
+
+    const condensedRow = db.prepare(
+      `SELECT depth, earliest_at, latest_at, descendant_count, source_message_token_count
+       FROM summaries
+       WHERE summary_id = ?`,
+    ).get("sum-condensed") as {
+      depth: number;
+      earliest_at: string | null;
+      latest_at: string | null;
+      descendant_count: number;
+      source_message_token_count: number;
+    };
+    expect(condensedRow).toEqual({
+      depth: 0,
+      earliest_at: null,
+      latest_at: null,
+      descendant_count: 0,
+      source_message_token_count: 0,
+    });
+
+    const messagePartRow = db.prepare(
+      `SELECT tool_call_id, tool_name, tool_input
+       FROM message_parts
+       WHERE part_id = ?`,
+    ).get("part-1") as {
+      tool_call_id: string | null;
+      tool_name: string | null;
+      tool_input: string | null;
+    };
+    expect(messagePartRow).toEqual({
+      tool_call_id: null,
+      tool_name: null,
+      tool_input: null,
+    });
+
+    expect(logMessages.filter((message) => message.includes("migration step skipped"))).toEqual([
+      "[lcm] migration step skipped: step=backfillSummaryDepths algorithmVersion=1 reason=already-complete",
+      "[lcm] migration step skipped: step=backfillSummaryMetadata algorithmVersion=1 reason=already-complete",
+      "[lcm] migration step skipped: step=backfillToolCallColumns algorithmVersion=1 reason=already-complete",
+    ]);
+  });
+
+  it("wraps the full migration in one exclusive transaction", () => {
+    const db = createTestDb("exclusive-transaction.db");
+    seedLegacySummaryGraph(db);
+
+    const execCalls: string[] = [];
+    const instrumentedDb = {
+      prepare(sql: string) {
+        return db.prepare(sql);
+      },
+      exec(sql: string) {
+        execCalls.push(sql.trim());
+        return db.exec(sql);
+      },
+    } as unknown as Parameters<typeof runLcmMigrations>[0];
+
+    runLcmMigrations(instrumentedDb, { fts5Available: false });
+
+    const beginStatements = execCalls.filter((sql) => sql.startsWith("BEGIN"));
+    expect(beginStatements).toEqual(["BEGIN EXCLUSIVE"]);
+    expect(execCalls.at(-1)).toBe("COMMIT");
+  });
+
+  it("retries a versioned backfill cleanly after the state write fails", () => {
+    const db = createTestDb("retry-state-write.db");
+    seedLegacySummaryGraph(db);
+
+    const failingDb = {
+      prepare(sql: string) {
+        if (sql.includes("INSERT INTO lcm_migration_state")) {
+          throw new Error("simulated state write failure");
+        }
+        return db.prepare(sql);
+      },
+      exec(sql: string) {
+        return db.exec(sql);
+      },
+    } as unknown as Parameters<typeof runLcmMigrations>[0];
+
+    expect(() => runLcmMigrations(failingDb, { fts5Available: false })).toThrow(
+      "simulated state write failure",
+    );
+
+    const failedSummaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as Array<{
+      name?: string;
+    }>;
+    const failedConversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
+      name?: string;
+    }>;
+    const migrationStateTable = db.prepare(
+      `SELECT name
+       FROM sqlite_master
+       WHERE type = 'table' AND name = 'lcm_migration_state'`,
+    ).get() as { name?: string } | undefined;
+
+    expect(failedSummaryColumns.some((column) => column.name === "depth")).toBe(false);
+    expect(failedSummaryColumns.some((column) => column.name === "earliest_at")).toBe(false);
+    expect(failedSummaryColumns.some((column) => column.name === "latest_at")).toBe(false);
+    expect(failedConversationColumns.some((column) => column.name === "session_key")).toBe(false);
+    expect(failedConversationColumns.some((column) => column.name === "active")).toBe(false);
+    expect(migrationStateTable).toBeUndefined();
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const recoveredRow = db.prepare(
+      `SELECT depth, earliest_at, latest_at, descendant_count, source_message_token_count
+       FROM summaries
+       WHERE summary_id = ?`,
+    ).get("sum-condensed") as {
+      depth: number;
+      earliest_at: string | null;
+      latest_at: string | null;
+      descendant_count: number;
+      source_message_token_count: number;
+    };
+
+    expect(recoveredRow.depth).toBe(1);
+    expect(recoveredRow.earliest_at).toContain("2026-01-01");
+    expect(recoveredRow.latest_at).toContain("2026-01-01");
+    expect(recoveredRow.descendant_count).toBe(1);
+    expect(recoveredRow.source_message_token_count).toBe(4);
+
+    const stateRowsAfterRetry = db
+      .prepare(
+        `SELECT step_name, algorithm_version
+         FROM lcm_migration_state
+         ORDER BY step_name`,
+      )
+      .all() as Array<{ step_name: string; algorithm_version: number }>;
+    expect(stateRowsAfterRetry).toEqual([
+      { step_name: "backfillSummaryDepths", algorithm_version: 1 },
+      { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
+      { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+    ]);
   });
 });

@@ -125,7 +125,7 @@ The assembler runs before each model turn and builds the message array:
 2. Resolve each item — summaries become user messages with XML wrappers; messages are reconstructed from parts.
 3. Split into evictable prefix and protected fresh tail (last `freshTailCount` raw messages).
 4. Compute fresh tail token cost (always included, even if over budget).
-5. Fill remaining budget from the evictable set, keeping newest items and dropping oldest.
+5. Fill remaining budget from the evictable set. By default this keeps newest older items and drops the oldest; when `promptAwareEviction` is enabled and a searchable prompt is present, the evictable prefix is ranked by prompt relevance first and then restored to chronological order.
 6. Normalize assistant content to array blocks (Anthropic API compatibility).
 7. Sanitize tool-use/result pairing (ensures every tool_result has a matching tool_use).
 
@@ -190,7 +190,7 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
 1. Parse file blocks from message content.
 2. For each block exceeding `largeFileTokenThreshold` (default 25k tokens):
    - Generate a unique file ID (`file_` prefix)
-   - Store the content to `~/.openclaw/lcm-files/<conversation_id>/<file_id>.<ext>`
+   - Store the content to `largeFilesDir/<conversation_id>/<file_id>.<ext>` (default `~/.openclaw/lcm-files/...`)
    - Generate a ~200 token exploration summary (structural analysis, key sections, etc.)
    - Insert a `large_files` record with metadata
    - Replace the file block in the message with a compact reference
