@@ -73,6 +73,11 @@ func runRewriteCommand(args []string) error {
 	}
 	defer db.Close()
 
+	settings := resolveTUISummaryRuntimeSettings(paths, opts.provider, opts.model, opts.baseURL, "", "")
+	opts.provider = settings.provider
+	opts.model = settings.model
+	opts.baseURL = settings.baseURL
+
 	ctx := context.Background()
 	targets, err := loadRewriteTargets(ctx, db, conversationID, opts)
 	if err != nil {
@@ -101,7 +106,7 @@ func runRewriteCommand(args []string) error {
 			apiKey:   apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
 			model:    opts.model,
-			baseURL:  resolveProviderBaseURL(paths, opts.provider, opts.baseURL),
+			baseURL:  opts.baseURL,
 		}
 	} else {
 		apiKey, err := resolveProviderAPIKey(paths, opts.provider)
@@ -111,7 +116,7 @@ func runRewriteCommand(args []string) error {
 				apiKey:   apiKey,
 				http:     &http.Client{Timeout: defaultHTTPTimeout},
 				model:    opts.model,
-				baseURL:  resolveProviderBaseURL(paths, opts.provider, opts.baseURL),
+				baseURL:  opts.baseURL,
 			}
 		}
 		if client == nil {
@@ -237,7 +242,6 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 	if opts.promptDir != "" {
 		opts.promptDir = expandHomePath(opts.promptDir)
 	}
-	opts.provider, opts.model = resolveSummaryProviderModel(opts.provider, opts.model)
 	if opts.apply {
 		opts.dryRun = false
 	}
@@ -332,6 +336,10 @@ Flags:
   --diff              show unified diff
   --timestamps        inject timestamps into source text (default true)
   --tz <timezone>     timezone for timestamps (e.g. America/Los_Angeles; default: system local)
+
+Env:
+  LCM_TUI_SUMMARY_PROVIDER / LCM_TUI_SUMMARY_MODEL / LCM_TUI_SUMMARY_BASE_URL
+  fall back to LCM_SUMMARY_PROVIDER / LCM_SUMMARY_MODEL / LCM_SUMMARY_BASE_URL
 `)
 }
 
@@ -419,13 +427,13 @@ func buildSummaryRewriteSource(ctx context.Context, q sqlQueryer, item rewriteSu
 }
 
 func buildLeafRewriteSource(ctx context.Context, q sqlQueryer, summaryID string, includeTimestamps bool, loc *time.Location) (rewriteSource, error) {
-	rows, err := q.QueryContext(ctx, `
-		SELECT m.role, COALESCE(m.content, ''), COALESCE(m.created_at, '')
+	rows, err := q.QueryContext(ctx, fmt.Sprintf(`
+		SELECT m.role, %s AS content, COALESCE(m.created_at, '')
 		FROM summary_messages sm
 		JOIN messages m ON m.message_id = sm.message_id
 		WHERE sm.summary_id = ?
 		ORDER BY sm.ordinal ASC
-	`, summaryID)
+	`, messageDisplayContentSQL("m")), summaryID)
 	if err != nil {
 		return rewriteSource{}, fmt.Errorf("query leaf source for %s: %w", summaryID, err)
 	}

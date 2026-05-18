@@ -43,6 +43,50 @@ Good starting range:
 
 - `32` to `64`
 
+### `freshTailMaxTokens`
+
+Optional token cap for the protected fresh tail.
+
+Why it matters:
+
+- Prevents a few huge tool results from making the "fresh" suffix effectively uncompactable.
+- Still preserves the newest message even if that single message exceeds the cap.
+
+Good starting range:
+
+- Leave unset unless large tool outputs are forcing avoidable cost or overflow.
+- Start around `12000` to `32000` when you want a softer, size-aware fresh tail.
+
+### `promptAwareEviction`
+
+Controls whether budget-constrained assembly keeps older context by prompt relevance or pure chronology.
+
+Why it matters:
+
+- when enabled, lossless-claw can keep an older but on-topic summary instead of a newer irrelevant one
+- this can improve retrieval quality when the assembled context is tight
+- it also makes the preserved prompt prefix less stable, which can reduce prefix-based prompt-cache hit rates
+
+Good default:
+
+- `false`
+- enable it only when topical older-context recall under tight budgets matters more than prompt-cache stability
+
+### `stubLargeToolPayloads`
+
+Controls whether older, evictable tool-result rows that were backfilled into the `large_files` store are assembled as compact `[LCM Tool Output: file_xxx ...]` stubs instead of full inline payloads.
+
+Why it matters:
+
+- it reuses the existing `large_files` drilldown path for old tool output without changing the fresh tail
+- it can recover substantially more historical context at the same token budget in tool-heavy sessions
+- it should stay off until the operator has run `scripts/lcm-blob-migrate.mjs` for the target database
+
+Good default:
+
+- `false`
+- enable it only after migration and live validation
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.
@@ -51,6 +95,7 @@ Why it matters:
 
 - Larger chunks reduce summarization frequency.
 - Smaller chunks create more summaries and more DAG fragmentation.
+- The default is 20000 tokens.
 
 Use this when:
 
@@ -59,37 +104,34 @@ Use this when:
 
 ### `cacheAwareCompaction`
 
-Controls how strongly lossless-claw preserves a healthy prompt cache during incremental maintenance.
+Deprecated compatibility object. Lossless still accepts and reports these settings, but automatic compaction no longer uses prompt-cache hot/cold state.
 
 Why it matters:
 
-- Hot cache now prefers to keep the cache intact instead of eagerly compacting old raw history.
-- Cold cache still allows bounded catch-up passes so stale sessions can converge.
-- The new defaults are intentionally more aggressive about preserving cache than earlier builds.
+- Existing OpenClaw configs continue to load without schema errors.
+- Operators can see that the settings are deprecated instead of silently losing familiar keys.
+- Prompt-cache telemetry remains useful for diagnostics, but it no longer gates compaction.
 
 Good defaults:
 
-- `enabled: true`
-- `maxColdCacheCatchupPasses: 2`
-- `hotCachePressureFactor: 4`
-- `hotCacheBudgetHeadroomRatio: 0.2`
+- Leave existing values in place during migration.
+- Do not tune these settings to affect automatic compaction; use `contextThreshold`, `leafChunkTokens`, and fanout instead.
 
 Operationally:
 
-- hot cache stretches the incremental leaf trigger to `dynamicLeafChunkTokens.max`
-- hot cache skips incremental maintenance entirely when the assembled context is comfortably below the real token budget
-- hot cache gets a short hysteresis window so a recent cache hit stays "hot" briefly unless telemetry shows a break
-- if hot-cache maintenance still runs, it stays leaf-only and suppresses follow-on condensed passes
+- threshold debt does not wait for cache TTL
+- cold-cache catch-up passes have been removed
+- cache-aware raw-history pressure no longer triggers automatic maintenance
 
 ### `dynamicLeafChunkTokens`
 
-Controls the working leaf-trigger size used by incremental compaction.
+Deprecated compatibility object. Automatic compaction now uses `leafChunkTokens` directly.
 
 Why it matters:
 
-- dynamic sizing is now enabled by default
-- busier sessions can use a larger working chunk without changing the static floor
-- hot cache uses the dynamic max as the working leaf trigger
+- Existing config stays accepted.
+- The resolved default still appears in status/config output.
+- It no longer changes automatic compaction chunk size.
 
 Good defaults:
 
@@ -100,15 +142,36 @@ With the default `leafChunkTokens=20000`, that means:
 
 - `dynamicLeafChunkTokens.max = 40000`
 
-### `incrementalMaxDepth`
+### `sweepMaxDepth`
 
-Controls how far automatic condensation cascades after leaf compaction.
+Controls how far routine threshold full-sweep condensation tries to cascade after leaf compaction.
 
 Why it matters:
 
 - `0` keeps only leaf summaries moving automatically.
 - `1` is a practical default for long-running sessions.
 - `-1` allows unlimited cascading, which can be useful for very long histories but is more aggressive.
+- This is a preferred depth, not an absolute cap. Pressure sweeps may go deeper when summarized context remains too large.
+
+### `summaryPrefixTargetTokens`
+
+Optional target for summarized-prefix tokens after a full sweep.
+
+Why it matters:
+
+- Gives Lossless an escape hatch when too many summaries at the preferred depth still leave the prompt near full.
+- When unset, Lossless derives a target from `contextThreshold`, the active token budget, and `leafChunkTokens`.
+- Sweeps first exhaust eligible raw-message leaf chunks, then honor `sweepMaxDepth`; pressure condensation can go deeper only when summary-prefix pressure remains.
+
+### `incrementalMaxDepth`
+
+Deprecated alias for `sweepMaxDepth`.
+
+Why it matters:
+
+- Existing OpenClaw configs continue to load.
+- New config should use `sweepMaxDepth`.
+- If both aliases are set in the same source, `sweepMaxDepth` wins.
 
 ### `summaryModel` and `summaryProvider`
 
@@ -123,6 +186,8 @@ Guidance:
 
 - Pick a cheaper model only if it remains reliably structured and faithful.
 - `summaryProvider` only matters when `summaryModel` is a bare model name rather than a canonical provider/model ref.
+- Summary calls go through OpenClaw's `api.runtime.llm.complete`; Lossless does not resolve provider credentials directly.
+- Explicit summary model overrides require `plugins.entries.lossless-claw.llm.allowModelOverride` plus matching `allowedModels` entries, or `openclaw doctor --fix` to add them.
 
 ### `expansionModel` and `expansionProvider`
 
@@ -154,6 +219,7 @@ Why it matters:
 
 - useful for custom deployments, testing, or isolating environments
 - wrong path selection is a common reason operators think LCM is empty or not growing
+- the default resolves to `${OPENCLAW_STATE_DIR}/lcm.db` (falls back to `~/.openclaw/lcm.db`)
 
 ### `databasePath`
 
@@ -164,6 +230,14 @@ Why it matters:
 - this is the documented key new config should use
 - `dbPath` is still accepted for compatibility
 
+### `largeFilesDir`
+
+Directory for persisting large-file text payloads externalised from the transcript.
+
+Why it matters:
+
+- defaults to `${OPENCLAW_STATE_DIR}/lcm-files`; on multi-profile hosts each profile stores files in its own state directory automatically
+- override with `LCM_LARGE_FILES_DIR` or set `largeFilesDir` in plugin config when you want an explicit path
 ### `largeFileThresholdTokens`
 
 Threshold for externalizing oversized tool/file payloads out of the main transcript into large-file storage.
@@ -172,6 +246,54 @@ Why it matters:
 
 - lower values externalize more aggressively
 - higher values keep more payload inline but can bloat storage and compaction inputs
+
+### `transcriptGcEnabled`
+
+Controls whether `maintain()` rewrites transcript entries for already-externalized tool results.
+
+Why it matters:
+
+- keep this off unless you want transcript GC to mutate the live session file during maintenance
+- the default is `false`
+
+### `proactiveThresholdCompactionMode`
+
+Controls whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior.
+
+Why it matters:
+
+- `deferred` is the default and avoids foreground turn stalls by recording one coalesced maintenance row per conversation
+- `deferred` also stores provider/model/cache telemetry so Anthropic-family sessions can avoid rewriting a still-hot prompt cache
+- `inline` preserves the legacy foreground compaction path for hosts that do not yet support deferred execution
+- `/lossless status` and `/lcm status` surface pending/running/last-failure maintenance state so operators can see when compaction is queued
+- background `maintain()` can still do non-prompt-mutating work, but prompt-mutating debt is consumed pre-assembly once cache is cold or the next turn is already approaching overflow
+
+### `autoRotateSessionFiles`
+
+Automatically rotates oversized LCM-managed session JSONL files.
+
+Defaults:
+
+- `enabled: true`
+- `createBackups: false`
+- `sizeBytes: 2097152`
+- `startup: "rotate"`
+- `runtime: "rotate"`
+
+Why it matters:
+
+- prevents very large OpenClaw session JSONL files from choking fallback/gateway startup while LCM owns the durable context
+- runtime rotation only creates or replaces the rolling `rotate-latest` DB backup when `createBackups` is `true`; manual `/lossless rotate` / `/lcm rotate` always keeps its backup-backed behavior
+- startup scans OpenClaw's current indexed session stores for configured agents, intersects those candidates with active LCM bootstrap state, and creates one pre-rotation DB backup for the startup batch only when `createBackups` is `true`
+- only runs for active, writable LCM conversations; ignored sessions, stateless sessions, sessions outside the indexed startup candidate set, and sessions without active LCM state are skipped
+- the preserved transcript tail follows the normal rotate behavior controlled by `freshTailCount`
+
+Operational logging:
+
+- every decision is logged with the prefix `[lcm] auto-rotate:`
+- startup emits one compact `action=summary` line with `scanned`, `eligible`, `rotated`, `warned`, `skipped`, `durationMs`, and `bytesRemoved`
+- rotate logs include `phase`, `action`, `sessionId`, `sessionKey`, `sessionFile`, `sizeBytes`, `thresholdBytes`, `durationMs`, `backupPath`, `bytesRemoved`, `preservedTailMessageCount`, and `checkpointSize`
+- real warning logs include the same available context plus `reason` or `error`; quiet startup skips such as missing files, missing bootstrap mappings, and below-threshold files are counted in the summary instead of logged per candidate
 
 ## Compaction timing and shape
 
@@ -182,6 +304,40 @@ See high-impact settings above.
 ### `freshTailCount`
 
 See high-impact settings above.
+
+### `freshTailMaxTokens`
+
+See high-impact settings above.
+
+### `promptAwareEviction`
+
+Boolean toggle for prompt-sensitive selection inside the evictable prefix during assembly.
+
+Why it matters:
+
+- only applies when the older evictable prefix does not fit the token budget
+- the protected fresh tail is unaffected
+- `true` keeps the most relevant older items for the current prompt
+- `false` falls back to pure chronological retention for the older prefix
+
+Env override:
+
+- `LCM_PROMPT_AWARE_EVICTION_ENABLED`
+
+### `stubLargeToolPayloads`
+
+Boolean toggle for assemble-time stub substitution of migrated tool-result payloads outside the protected fresh tail.
+
+Why it matters:
+
+- only affects rows whose `messages.large_content` sidecar points at a `file_xxx` record
+- the fresh tail is still emitted verbatim
+- drilldown uses `lcm_describe(id=file_xxx, expandFile=true)`
+- `scripts/lcm-blob-migrate.mjs` defaults to the same storage root as runtime LCM: `LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`
+
+Env override:
+
+- `LCM_STUB_LARGE_TOOL_PAYLOADS`
 
 ### `leafChunkTokens`
 
@@ -214,9 +370,29 @@ Why it matters:
 - acts as the guardrail when normal fanout preferences cannot be met cleanly
 - mostly useful for advanced tuning or pathological summary-tree shapes
 
-### `incrementalMaxDepth`
+### `sweepMaxDepth`
 
 See high-impact settings above.
+
+Env override:
+
+- `LCM_SWEEP_MAX_DEPTH`
+
+### `summaryPrefixTargetTokens`
+
+See high-impact settings above.
+
+Env override:
+
+- `LCM_SUMMARY_PREFIX_TARGET_TOKENS`
+
+### `incrementalMaxDepth`
+
+Deprecated alias for `sweepMaxDepth`.
+
+Env override:
+
+- `LCM_INCREMENTAL_MAX_DEPTH`
 
 ### `bootstrapMaxTokens`
 
@@ -291,20 +467,32 @@ Why it matters:
 
 #### `cacheAwareCompaction.enabled`
 
-Defers incremental leaf compaction more aggressively when prompt-cache telemetry indicates a hot cache.
+Deprecated compatibility setting. It remains accepted by config loading but no longer changes automatic compaction behavior.
 
-#### `cacheAwareCompaction.maxColdCacheCatchupPasses`
+#### `cacheAwareCompaction.cacheTTLSeconds`
 
-Maximum bounded catch-up passes allowed in one maintenance cycle when cache telemetry is cold.
-
-#### `cacheAwareCompaction.hotCachePressureFactor`
-
-Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation.
+Deprecated compatibility setting. Threshold debt no longer waits for a prompt-cache TTL.
 
 Why it matters:
 
-- higher values preserve hot cache longer
-- lower values revert toward more eager incremental compaction
+- existing configs continue to load
+- prompt-cache telemetry remains diagnostic only
+
+Default:
+
+- `300`
+
+#### `cacheAwareCompaction.maxColdCacheCatchupPasses`
+
+Deprecated compatibility setting. Automatic cold-cache catch-up passes were removed.
+
+#### `cacheAwareCompaction.hotCachePressureFactor`
+
+Deprecated compatibility setting. Hot-cache raw-history pressure no longer drives automatic compaction.
+
+Why it matters:
+
+- use `contextThreshold`, `leafChunkTokens`, and fanout for active compaction tuning
 
 Default:
 
@@ -312,22 +500,50 @@ Default:
 
 #### `cacheAwareCompaction.hotCacheBudgetHeadroomRatio`
 
-Minimum fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely.
+Deprecated compatibility setting. Hot-cache budget headroom no longer defers automatic threshold compaction.
 
 Why it matters:
 
-- higher values make hot-cache skip behavior stricter
-- lower values allow more hot-cache maintenance before real budget pressure exists
+- threshold debt runs when the context threshold is crossed
 
 Default:
 
 - `0.2`
 
+#### `cacheAwareCompaction.coldCacheObservationThreshold`
+
+Deprecated compatibility setting. Cold-cache streaks may still be observable telemetry, but they no longer trigger catch-up compaction.
+
+Why it matters:
+
+- cache state is not reliable enough to drive prompt-mutating compaction
+
+Default:
+
+- `3`
+
+#### `cacheAwareCompaction.criticalBudgetPressureRatio`
+
+Deprecated compatibility setting. `contextThreshold` is now the only automatic compaction threshold.
+
+Why it matters:
+
+- the hot-cache delay gate has been removed
+- overflow recovery still uses explicit budget-targeted compaction
+
+Default:
+
+- `0.90`
+
+Env override:
+
+- `LCM_CRITICAL_BUDGET_PRESSURE_RATIO`
+
 ### `dynamicLeafChunkTokens`
 
 #### `dynamicLeafChunkTokens.enabled`
 
-Enables dynamic working leaf chunk sizes for busier sessions.
+Deprecated compatibility setting. Automatic compaction uses `leafChunkTokens` directly.
 
 Default:
 
@@ -335,7 +551,7 @@ Default:
 
 #### `dynamicLeafChunkTokens.max`
 
-Upper bound for the dynamic working chunk size. The static `leafChunkTokens` value remains the floor.
+Deprecated compatibility setting. The resolved value is still accepted and visible, but no longer changes automatic compaction.
 
 Default:
 
@@ -367,12 +583,10 @@ Why it matters:
 2. Set the context-engine slot to `lossless-claw`.
 3. Start with conservative defaults.
 4. Run `/lossless` after startup to confirm path, size, and summary health.
-5. If hot-cache turns still compact too often, inspect the decision logs before changing anything else:
-   - `reason=hot-cache-budget-headroom` means the new skip path is working.
-   - `reason=hot-cache-defer` means raw-history pressure is below the configured hot-cache factor.
-   - `allowCondensedPasses=false` on hot-cache turns is expected.
-6. If recall feels weak, revisit `freshTailCount`, `leafChunkTokens`, and summarizer model quality before changing anything else.
-7. Touch advanced knobs like fanout, large-file thresholds, custom instructions, and assembly caps only after a concrete symptom appears.
+5. If threshold sweeps happen too often, tune `contextThreshold`, `leafChunkTokens`, `summaryPrefixTargetTokens`, and fanout before adding new mechanisms.
+6. If threshold sweeps happen too often, try a larger `leafChunkTokens` value such as 30000 before adding new mechanisms.
+7. If recall feels weak, revisit `freshTailCount`, `leafChunkTokens`, and summarizer model quality before changing anything else.
+8. Touch advanced knobs like fanout, large-file thresholds, custom instructions, and assembly caps only after a concrete symptom appears.
 
 ## Reading the status output
 

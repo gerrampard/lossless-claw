@@ -3,18 +3,27 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 type ConnectionKey = string;
-const SQLITE_BUSY_TIMEOUT_MS = 5_000;
+/**
+ * SQLite busy timeout in milliseconds.  30 s accommodates high-concurrency
+ * multi-agent setups where 10+ writers contend on the WAL.  The default 5 s
+ * proved insufficient in production with ≥13 concurrent lanes.
+ */
+const SQLITE_BUSY_TIMEOUT_MS = 30_000;
 
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
 
+function normalizeDbPathInput(dbPath: string): string {
+  return typeof dbPath === "string" ? dbPath.trim() : "";
+}
+
 export function isInMemoryPath(dbPath: string): boolean {
-  const normalized = dbPath.trim();
+  const normalized = normalizeDbPathInput(dbPath);
   return normalized === ":memory:" || normalized.startsWith("file::memory:");
 }
 
 export function getFileBackedDatabasePath(dbPath: string): string | null {
-  const trimmed = dbPath.trim();
+  const trimmed = normalizeDbPathInput(dbPath);
   if (!trimmed || isInMemoryPath(trimmed)) {
     return null;
   }
@@ -24,7 +33,7 @@ export function getFileBackedDatabasePath(dbPath: string): string | null {
 export function normalizePath(dbPath: string): ConnectionKey {
   const fileBackedDatabasePath = getFileBackedDatabasePath(dbPath);
   if (!fileBackedDatabasePath) {
-    const trimmed = dbPath.trim();
+    const trimmed = normalizeDbPathInput(dbPath);
     return trimmed.length > 0 ? trimmed : ":memory:";
   }
   return fileBackedDatabasePath;

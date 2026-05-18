@@ -16,17 +16,23 @@ Most installations only need to override a handful of keys. If you want a comple
 {
   "enabled": true,
   "databasePath": "/Users/alice/.openclaw/lcm.db",
+  "largeFilesDir": "/Users/alice/.openclaw/lcm-files",
   "ignoreSessionPatterns": [],
   "statelessSessionPatterns": [],
   "skipStatelessSessions": true,
   "contextThreshold": 0.75,
   "freshTailCount": 64,
+  "freshTailMaxTokens": 24000,
+  "promptAwareEviction": false,
+  "stubLargeToolPayloads": false,
   "newSessionRetainDepth": 2,
   "leafMinFanout": 8,
   "condensedMinFanout": 4,
   "condensedMinFanoutHard": 2,
+  "sweepMaxDepth": 1,
   "incrementalMaxDepth": 1,
   "leafChunkTokens": 20000,
+  "summaryPrefixTargetTokens": 20000,
   "bootstrapMaxTokens": 6000,
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
@@ -42,17 +48,29 @@ Most installations only need to override a handful of keys. If you want a comple
   "summaryTimeoutMs": 60000,
   "timezone": "America/Los_Angeles",
   "pruneHeartbeatOk": false,
+  "transcriptGcEnabled": false,
   "maxAssemblyTokenBudget": 30000,
   "summaryMaxOverageFactor": 3,
   "customInstructions": "",
   "circuitBreakerThreshold": 5,
   "circuitBreakerCooldownMs": 1800000,
   "fallbackProviders": [],
+  "proactiveThresholdCompactionMode": "deferred",
+  "autoRotateSessionFiles": {
+    "enabled": true,
+    "createBackups": false,
+    "sizeBytes": 2097152,
+    "startup": "rotate",
+    "runtime": "rotate"
+  },
   "cacheAwareCompaction": {
     "enabled": true,
+    "cacheTTLSeconds": 300,
     "maxColdCacheCatchupPasses": 2,
     "hotCachePressureFactor": 4,
-    "hotCacheBudgetHeadroomRatio": 0.2
+    "hotCacheBudgetHeadroomRatio": 0.2,
+    "coldCacheObservationThreshold": 3,
+    "criticalBudgetPressureRatio": 0.90
   },
   "dynamicLeafChunkTokens": {
     "enabled": true,
@@ -65,8 +83,10 @@ Notes on the example:
 
 - Values shown are the runtime defaults when a fixed default exists.
 - `databasePath` shows the expanded default path shape. Use an absolute path in config rather than `~`.
+- `largeFilesDir` shows the expanded default path shape. Both `databasePath` and `largeFilesDir` default to paths under `OPENCLAW_STATE_DIR` (which in turn falls back to `~/.openclaw`).
 - `timezone` has no fixed hardcoded default; at runtime it resolves from `TZ` first, then the system timezone. The example uses `America/Los_Angeles`.
 - `maxAssemblyTokenBudget` has no default. The example uses `30000` as a realistic cap for a 32k-class model.
+- `summaryPrefixTargetTokens` has no fixed default. The example uses `20000`, which matches the derived default for large-context models with the default `leafChunkTokens`.
 - `databasePath` is the preferred key. `dbPath` is an accepted alias.
 - `largeFileThresholdTokens` is the preferred key. `largeFileTokenThreshold` is an accepted alias.
 
@@ -97,14 +117,28 @@ openclaw plugins install --link /path/to/lossless-claw
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
 | `enabled` | `boolean` | `true` | `LCM_ENABLED` | Enables or disables lossless-claw without uninstalling it. |
-| `databasePath` | `string` | `${HOME}/.openclaw/lcm.db` | `LCM_DATABASE_PATH` | Preferred path for the SQLite database. |
+| `databasePath` | `string` | `${OPENCLAW_STATE_DIR}/lcm.db` | `LCM_DATABASE_PATH` | Preferred path for the SQLite database. |
 | `dbPath` | `string` | alias of `databasePath` | `LCM_DATABASE_PATH` | Legacy alias for `databasePath`. Prefer `databasePath` in new config. |
+| `largeFilesDir` | `string` | `${OPENCLAW_STATE_DIR}/lcm-files` | `LCM_LARGE_FILES_DIR` | Directory where externalized large files and inline images are persisted. Automatically follows the active state directory. |
 | `ignoreSessionPatterns` | `string[]` | `[]` | `LCM_IGNORE_SESSION_PATTERNS` | Session-key glob patterns that skip LCM entirely. |
 | `statelessSessionPatterns` | `string[]` | `[]` | `LCM_STATELESS_SESSION_PATTERNS` | Session-key glob patterns that may read from LCM but never write to it. |
 | `skipStatelessSessions` | `boolean` | `true` | `LCM_SKIP_STATELESS_SESSIONS` | Enforces `statelessSessionPatterns` when enabled. |
 | `newSessionRetainDepth` | `integer` | `2` | `LCM_NEW_SESSION_RETAIN_DEPTH` | Controls what survives `/new`. `-1` keeps all context, `0` keeps summaries only, higher values keep only deeper summaries. |
 | `timezone` | `string` | `TZ` or system timezone | `TZ` | IANA timezone used for timestamp rendering in summaries. |
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |
+| `transcriptGcEnabled` | `boolean` | `false` | `LCM_TRANSCRIPT_GC_ENABLED` | Enables transcript rewrite GC during `maintain()`; disabled by default so transcript rewrites stay opt-in. |
+| `proactiveThresholdCompactionMode` | `"deferred" \| "inline"` | `"deferred"` | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | Controls whether proactive threshold compaction is deferred into maintenance debt by default or run inline for legacy behavior. |
+| `autoRotateSessionFiles.enabled` | `boolean` | `true` | `LCM_AUTO_ROTATE_SESSION_FILES_ENABLED` | Enables automatic rotation for oversized LCM-managed session JSONL files. |
+| `autoRotateSessionFiles.createBackups` | `boolean` | `false` | `LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS` | Creates or replaces the rolling `rotate-latest` SQLite backup before automatic session-file rotation. Manual `/lcm rotate` backups are always created. |
+| `autoRotateSessionFiles.sizeBytes` | `integer` | `2097152` | `LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES` | Byte threshold that triggers automatic session-file rotation. |
+| `autoRotateSessionFiles.startup` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_STARTUP` | Startup behavior for oversized indexed OpenClaw session transcripts that also have active LCM bootstrap state. |
+| `autoRotateSessionFiles.runtime` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME` | Runtime behavior after `afterTurn()` and `maintain()` check the current transcript size. |
+
+> **Multi-profile note:** `OPENCLAW_STATE_DIR` (set by the host OpenClaw gateway) controls where state is stored. When two gateways run on the same host (e.g. separate bot personas), each gateway sets its own `OPENCLAW_STATE_DIR` and lossless-claw automatically uses that directory for the database, large-file payloads, auth-profile lookups, and legacy secrets — no per-profile plugin config is needed.
+
+Automatic session-file rotation rewrites only the live session transcript, keeps the active LCM conversation and durable history intact, and refreshes the bootstrap checkpoint. Startup rotation first scans OpenClaw's current indexed session stores for configured agents, then intersects those candidates with active LCM conversations and matching bootstrap file mappings. Automatic rotation does not create a SQLite backup by default; set `autoRotateSessionFiles.createBackups` to `true` to make runtime rotation replace the rolling `rotate-latest` backup and to make startup rotation create one pre-rotation LCM database backup for the batch before any transcript is rewritten. Manual `/lcm rotate` always keeps its backup-backed behavior regardless of this flag. Rotation never runs for ignored sessions, stateless sessions, or sessions without active LCM state. The preserved JSONL tail follows the existing rotate behavior, which is controlled by `freshTailCount`.
+
+Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rotate:`. Startup emits one compact summary line with `phase=startup`, `action=summary`, `scanned`, `eligible`, `rotated`, `warned`, `skipped`, `durationMs`, `bytesRemoved`, and backup fields when a batch backup was created; quiet skips such as missing files, missing bootstrap mappings, and below-threshold files are counted there instead of producing one line per candidate. Rotation detail lines include `phase`, `action`, `sessionId`, `sessionKey`, `sessionFile`, `sizeBytes`, `thresholdBytes`, `durationMs`, `backupPath`, `bytesRemoved`, `preservedTailMessageCount`, and `checkpointSize`; real warning lines include the same available context plus `reason` or `error`.
 
 ### Compaction thresholds and summary sizing
 
@@ -112,11 +146,16 @@ openclaw plugins install --link /path/to/lossless-claw
 | --- | --- | --- | --- | --- |
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |
 | `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. |
+| `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest message is always preserved even if it exceeds the cap. |
+| `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
+| `stubLargeToolPayloads` | `boolean` | `false` | `LCM_STUB_LARGE_TOOL_PAYLOADS` | When enabled, evictable tool-result rows backfilled with `messages.large_content` are assembled as `[LCM Tool Output: file_xxx ...]` stubs while the fresh tail stays inline. Requires `scripts/lcm-blob-migrate.mjs`, which defaults to the same large-files root as runtime LCM (`LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`). |
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
-| `incrementalMaxDepth` | `integer` | `1` | `LCM_INCREMENTAL_MAX_DEPTH` | Maximum automatic condensation depth after leaf compaction. Use `0` for leaf-only and `-1` for unlimited depth. |
-| `leafChunkTokens` | `integer` | `20000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. |
+| `sweepMaxDepth` | `integer` | `1` | `LCM_SWEEP_MAX_DEPTH` | Preferred maximum condensation source depth during routine threshold sweeps. Use `0` for leaf-only and `-1` for unlimited depth. Pressure sweeps may go deeper when summarized context remains above target. |
+| `incrementalMaxDepth` | `integer` | alias of `sweepMaxDepth` | `LCM_INCREMENTAL_MAX_DEPTH` | Deprecated alias for `sweepMaxDepth`. Kept so existing configs continue to load. |
+| `leafChunkTokens` | `integer` | `20000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. Larger chunks reduce sweep frequency at the cost of slower individual summary calls. |
+| `summaryPrefixTargetTokens` | `integer` | derived | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | Optional target for summarized-prefix tokens after a full sweep. If unset, Lossless derives `max(condensedTargetTokens, min(leafChunkTokens, floor(contextThreshold * tokenBudget * 0.5)))`. |
 | `bootstrapMaxTokens` | `integer` | `max(6000, floor(leafChunkTokens * 0.3))` | `LCM_BOOTSTRAP_MAX_TOKENS` | Maximum parent-history tokens imported when a new LCM conversation bootstraps. |
 | `leafTargetTokens` | `integer` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Prompt target for leaf summary size. |
 | `condensedTargetTokens` | `integer` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Prompt target for condensed summary size. |
@@ -140,6 +179,8 @@ openclaw plugins install --link /path/to/lossless-claw
 | `summaryTimeoutMs` | `integer` | `60000` | `LCM_SUMMARY_TIMEOUT_MS` | Maximum time to wait for one model-backed summarizer call. |
 | `customInstructions` | `string` | `""` | `LCM_CUSTOM_INSTRUCTIONS` | Extra natural-language instructions injected into every summarization prompt. |
 
+Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. If you configure an explicit Lossless summary model (`summaryModel`, `largeFileSummaryModel`, or `fallbackProviders`), OpenClaw must allow that runtime LLM override under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for configured Lossless summary models. Delegated expansion calls use OpenClaw's runtime sub-agent layer; explicit `expansionModel` values require `plugins.entries.lossless-claw.subagent.allowModelOverride` and a matching `subagent.allowedModels` entry, or `"*"` if you intentionally trust any expansion target. `openclaw doctor --fix` can add the minimal subagent policy, and `lcm_expand_query` retries once without the override if the host rejects it.
+
 ### Fallbacks, circuit breaking, and safety rails
 
 | Key | Type | Default | Env override | Purpose |
@@ -154,28 +195,48 @@ openclaw plugins install --link /path/to/lossless-claw
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
-| `cacheAwareCompaction.enabled` | `boolean` | `true` | `LCM_CACHE_AWARE_COMPACTION_ENABLED` | Defers incremental leaf compaction more aggressively when prompt-cache telemetry indicates a hot cache. |
-| `cacheAwareCompaction.maxColdCacheCatchupPasses` | `integer` | `2` | `LCM_MAX_COLD_CACHE_CATCHUP_PASSES` | Maximum bounded catch-up passes allowed in one maintenance cycle when cache telemetry is cold. |
-| `cacheAwareCompaction.hotCachePressureFactor` | `number` | `4` | `LCM_HOT_CACHE_PRESSURE_FACTOR` | Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation. |
-| `cacheAwareCompaction.hotCacheBudgetHeadroomRatio` | `number` | `0.2` | `LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO` | Minimum fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely. |
+| `cacheAwareCompaction.enabled` | `boolean` | `true` | `LCM_CACHE_AWARE_COMPACTION_ENABLED` | Deprecated. Accepted for config compatibility but no longer used for automatic compaction decisions. |
+| `cacheAwareCompaction.cacheTTLSeconds` | `integer` | `300` | `LCM_CACHE_TTL_SECONDS` | Deprecated. Accepted for config compatibility; threshold debt no longer waits for cache TTL. |
+| `cacheAwareCompaction.maxColdCacheCatchupPasses` | `integer` | `2` | `LCM_MAX_COLD_CACHE_CATCHUP_PASSES` | Deprecated. Automatic cold-cache catch-up passes were removed. |
+| `cacheAwareCompaction.hotCachePressureFactor` | `number` | `4` | `LCM_HOT_CACHE_PRESSURE_FACTOR` | Deprecated. Hot-cache raw-history pressure no longer drives automatic compaction. |
+| `cacheAwareCompaction.hotCacheBudgetHeadroomRatio` | `number` | `0.2` | `LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO` | Deprecated. Hot-cache budget headroom no longer defers automatic threshold compaction. |
+| `cacheAwareCompaction.coldCacheObservationThreshold` | `integer` | `3` | `LCM_COLD_CACHE_OBSERVATION_THRESHOLD` | Deprecated. Cold-cache streaks remain observable telemetry only. |
+| `cacheAwareCompaction.criticalBudgetPressureRatio` | `number` | `0.90` | `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | Deprecated. `contextThreshold` is the only automatic compaction threshold. |
 
 #### `dynamicLeafChunkTokens`
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
-| `dynamicLeafChunkTokens.enabled` | `boolean` | `true` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Enables dynamic working leaf chunk sizes for busier sessions. |
-| `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Upper bound for the dynamic working chunk size. With the default `leafChunkTokens=20000`, this resolves to `40000`. |
+| `dynamicLeafChunkTokens.enabled` | `boolean` | `true` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Deprecated. Accepted for config compatibility but no longer used by automatic compaction. |
+| `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Deprecated. With the default `leafChunkTokens=20000`, this resolves to `40000`, but automatic compaction uses `leafChunkTokens`. |
 
-### Cache-aware incremental compaction
+### Threshold full-sweep compaction
 
-When cache-aware compaction is enabled:
+Automatic compaction is threshold-only:
 
-- hot cache stretches the incremental leaf trigger to `dynamicLeafChunkTokens.max`
-- hot cache skips incremental maintenance entirely when the assembled context is still comfortably below the real token budget
-- hot cache also gets a short hysteresis window so one ambiguous turn does not immediately discard a recently healthy cache signal
-- cold cache still allows bounded catch-up passes via `cacheAwareCompaction.maxColdCacheCatchupPasses`
+- `afterTurn()` evaluates `contextThreshold` against the active token budget
+- below threshold, no automatic compaction runs and no leaf debt is recorded
+- at or above threshold, inline mode runs a threshold full sweep immediately
+- deferred mode records one coalesced `"threshold"` maintenance row and drains it in the background, `maintain()`, or pre-assembly
 
-When incremental leaf compaction still runs on a hot cache, follow-on condensed passes are suppressed so the maintenance cycle only pays for the leaf pass that was explicitly justified.
+Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
+
+Full sweeps first run leaf passes until there are no more eligible raw-message chunks outside the fresh tail. Condensation is then driven by summarized-prefix pressure: the routine condensation phase obeys `sweepMaxDepth`, and if the summarized prefix still exceeds `summaryPrefixTargetTokens`, a pressure phase may use `condensedMinFanoutHard` and condense deeper. Total context pressure starts the sweep, but does not by itself force deeper condensation once the raw prefix has been summarized.
+
+### Prompt-aware eviction
+
+When `promptAwareEviction` is enabled:
+
+- the protected fresh tail is still preserved exactly as usual
+- only the older evictable prefix is affected
+- if the evictable prefix does not fit and the current prompt has searchable terms, lossless-claw keeps the most relevant older items instead of just the newest older items
+
+Tradeoff:
+
+- this can improve retrieval quality when the prompt is asking about an older topic and the assembled context is tight
+- it also makes the assembled prefix less stable for providers with prefix-based prompt caching, because different prompts can keep different older items
+
+If Anthropic prompt-cache stability matters more than topical recall under pressure, set `promptAwareEviction: false`.
 
 ## Behavior notes
 
@@ -186,12 +247,12 @@ Compaction summarization resolves candidates in this order:
 1. `LCM_SUMMARY_MODEL` and `LCM_SUMMARY_PROVIDER`
 2. `plugins.entries.lossless-claw.config.summaryModel` and `summaryProvider`
 3. OpenClaw's default compaction model
-4. Legacy per-call provider and model hints
+4. Runtime/session provider and model hints from OpenClaw
 5. `fallbackProviders`
 
 If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that candidate.
 
-Runtime-managed OAuth providers are supported here too. In particular, `openai-codex` and `github-copilot` auth profiles can be used for summary and expansion calls without a separate API key.
+Lossless does not resolve provider credentials directly for compaction summaries. OpenClaw's runtime LLM layer owns provider/model preparation, auth profiles, OAuth refresh, base URLs, and dispatch. Lossless only selects the requested summary target and passes it to the host runtime, where model override policy is enforced.
 
 A practical starting point for cost-sensitive setups is:
 
@@ -231,22 +292,46 @@ Lossless-claw treats OpenClaw reset commands differently:
 
 This keeps long-term history available while still giving users a real clean-slate reset.
 
+### Deferred proactive compaction
+
+Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
+
+- deferred mode records a single coalesced maintenance debt row per conversation
+- new deferred compaction debt is only created for `contextThreshold` pressure and uses reason `"threshold"`
+- `maintain()` consumes threshold debt when the host explicitly opts in to deferred execution
+- `assemble()` consumes pending threshold debt before building the next prompt
+- old non-threshold debt from earlier builds is revalidated; if the conversation is no longer over threshold, it is cleared as a no-op
+- `/lcm status` / `/lossless status` shows the current maintenance state, including pending/running/last-failure details
+- status output also surfaces the latest API/cache telemetry as diagnostics, not as a deferral gate
+- set `proactiveThresholdCompactionMode` to `inline` only if you need the legacy inline proactive compaction behavior for compatibility
+
+### `/lcm rotate`
+
+`/lcm rotate` exists for a different use case than `/new` or `/reset`:
+
+- `/new` keeps the same active LCM conversation row and only prunes context.
+- `/reset` changes OpenClaw session flow, which is sometimes more disruptive than users want.
+- `/lcm rotate` keeps the live OpenClaw session identity and the same active LCM conversation row, but rewrites the backing transcript into a compact preserved-tail form.
+
+Before rotating, Lossless-claw replaces one rolling `rotate-latest` SQLite backup. It then rewrites the current session transcript and checkpoints the same conversation at the new transcript frontier so bootstrap does not replay the dropped transcript history. Existing summaries, context items, and conversation identity stay in place. If you want additional timestamped snapshots, run `/lcm backup` explicitly before `/lcm rotate`.
+
 ## Environment-only knobs outside plugin config
 
 These settings are not part of `plugins.entries.lossless-claw.config`, but they still affect the system:
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
+| `OPENCLAW_STATE_DIR` | `~/.openclaw` | Active state directory for the OpenClaw gateway. When set, all path defaults (database, large files, auth profiles, secrets) resolve relative to this directory instead of `~/.openclaw`. Set automatically by OpenClaw for non-default profiles. |
 | `LCM_TUI_CONVERSATION_WINDOW_SIZE` | `200` | Number of messages `lcm-tui` loads per keyset-paged conversation window. |
 
 ## Database operations
 
-The SQLite database lives at `databasePath` or `LCM_DATABASE_PATH`. The default path is `${HOME}/.openclaw/lcm.db`.
+The SQLite database lives at `databasePath` or `LCM_DATABASE_PATH`. The default path is `${OPENCLAW_STATE_DIR}/lcm.db` (resolves to `~/.openclaw/lcm.db` when `OPENCLAW_STATE_DIR` is not set).
 
 Inspect it with:
 
 ```bash
-sqlite3 ~/.openclaw/lcm.db
+sqlite3 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db"
 
 SELECT COUNT(*) FROM conversations;
 SELECT * FROM context_items WHERE conversation_id = 1 ORDER BY ordinal;
@@ -257,8 +342,14 @@ SELECT summary_id, depth, token_count FROM summaries ORDER BY token_count DESC L
 Back it up with:
 
 ```bash
-cp ~/.openclaw/lcm.db ~/.openclaw/lcm.db.backup
-sqlite3 ~/.openclaw/lcm.db ".backup ~/.openclaw/lcm.db.backup"
+cp "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db" "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db.backup"
+sqlite3 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db" ".backup ${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db.backup"
+```
+
+Or from a supported OpenClaw chat/native command surface:
+
+```text
+/lcm backup
 ```
 
 ## Disabling lossless-claw

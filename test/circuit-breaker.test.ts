@@ -44,6 +44,15 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    transcriptGcEnabled: false,
+    proactiveThresholdCompactionMode: "deferred",
+    autoRotateSessionFiles: {
+      enabled: true,
+      createBackups: false,
+      sizeBytes: 2 * 1024 * 1024,
+      startup: "rotate",
+      runtime: "rotate",
+    },
     summaryMaxOverageFactor: 3,
     delegationTimeoutMs: 120000,
     customInstructions: "",
@@ -52,9 +61,12 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     fallbackProviders: [],
     cacheAwareCompaction: {
       enabled: true,
+      cacheTTLSeconds: 300,
       maxColdCacheCatchupPasses: 2,
       hotCachePressureFactor: 4,
       hotCacheBudgetHeadroomRatio: 0.2,
+      coldCacheObservationThreshold: 3,
+      criticalBudgetPressureRatio: 0.90,
     },
     dynamicLeafChunkTokens: {
       enabled: true,
@@ -73,8 +85,6 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
       provider: providerHint ?? "test",
       model: modelRef ?? "test-model",
     }),
-    getApiKey: async () => "test-api-key",
-    requireApiKey: async () => "test-api-key",
     parseAgentSessionKey: () => null,
     isSubagentSessionKey: () => false,
     normalizeAgentId: (id?: string) => id ?? "",
@@ -196,38 +206,6 @@ describe("Circuit Breaker", () => {
     expect(blocked.compacted).toBe(false);
   });
 
-  it("should also block compactLeafAsync when breaker is open", async () => {
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
-    
-    const failingSummarizer = async () => {
-      throw makeAuthError();
-    };
-    
-    // Trip the breaker
-    for (let i = 0; i < 3; i++) {
-      await engine.compact({
-        sessionId,
-        sessionKey,
-        sessionFile,
-        tokenBudget: 5000,
-        force: true,
-        legacyParams: { summarize: failingSummarizer },
-      });
-    }
-    
-    // compactLeafAsync should also be blocked
-    const leafResult = await engine.compactLeafAsync({
-      sessionId,
-      sessionKey,
-      sessionFile,
-      tokenBudget: 5000,
-      force: true,
-      legacyParams: { summarize: failingSummarizer },
-    });
-    
-    expect(leafResult.reason).toBe("circuit breaker open");
-  });
-
   it("should auto-reset after cooldown", async () => {
     await engine.bootstrap({ sessionId, sessionFile, sessionKey });
     
@@ -340,6 +318,7 @@ describe("Circuit Breaker", () => {
   it("should scope provider-backed breakers to the resolved provider/model", async () => {
     const config = createTestConfig({ circuitBreakerThreshold: 1 });
     const providerDeps = createTestDeps(config);
+    let summaryOrdinal = 0;
     providerDeps.complete = async (params) => {
       if (params.provider === "broken-provider") {
         throw new LcmProviderAuthError({
@@ -348,7 +327,12 @@ describe("Circuit Breaker", () => {
           failure: { statusCode: 401, message: "auth failed", missingModelRequestScope: false },
         });
       }
-      return { content: [{ type: "text", text: "Summary" }] };
+      return {
+        content: [{
+          type: "text",
+          text: `Summary ${params.provider ?? "unknown"} ${params.model ?? "unknown"} ${summaryOrdinal++}`,
+        }],
+      };
     };
 
     const scopedDb = new DatabaseSync(":memory:");

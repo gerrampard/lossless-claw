@@ -24,6 +24,7 @@ export type {
   ContextItemRecord,
   SummarySearchInput,
   SummarySearchResult,
+  SummaryMessageSeqRangeRecord,
   CreateLargeFileInput,
   LargeFileRecord,
   UpsertConversationBootstrapStateInput,
@@ -37,3 +38,19 @@ export type {
   ConversationCompactionTelemetryRecord,
   UpsertConversationCompactionTelemetryInput,
 } from "./compaction-telemetry-store.js";
+
+export { CompactionMaintenanceStore } from "./compaction-maintenance-store.js";
+export type {
+  ConversationCompactionMaintenanceRecord,
+} from "./compaction-maintenance-store.js";
+
+export { FocusBriefStore, hashFocusSourceContext } from "./focus-brief-store.js";
+export type {
+  ActiveFocusSummaryRecord,
+  CreateFocusBriefInput,
+  FocusBriefDiagnostics,
+  FocusBriefRecord,
+  FocusBriefSourceRecord,
+  FocusBriefSourceRole,
+  FocusBriefStatus,
+} from "./focus-brief-store.js";

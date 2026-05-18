@@ -1,5 +1,9 @@
 import { describeLogError } from "./lcm-log.js";
-import type { LcmDependencies } from "./types.js";
+import type {
+  LcmDependencies,
+  RuntimeLlmCompleteFn,
+  RuntimeLlmModelOverride,
+} from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 
 export type LcmSummarizeOptions = {
@@ -17,9 +21,12 @@ export type LcmSummarizeFn = (
 export type LcmSummarizerLegacyParams = {
   provider?: unknown;
   model?: unknown;
+  modelConfigField?: unknown;
+  modelConfigPath?: unknown;
   config?: unknown;
-  agentDir?: unknown;
-  authProfileId?: unknown;
+  llm?: unknown;
+  agentId?: unknown;
+  sessionKey?: unknown;
 };
 
 type SummaryResolutionCandidate = {
@@ -27,7 +34,8 @@ type SummaryResolutionCandidate = {
   modelRef: string;
   providerHint?: string;
   hasExplicitProvider: boolean;
-  useLegacyAuthProfile: boolean;
+  runtimeModelOverrideField?: string;
+  runtimeModelOverrideConfigPath?: string;
 };
 
 type ResolvedSummaryCandidate = SummaryResolutionCandidate & {
@@ -35,14 +43,34 @@ type ResolvedSummaryCandidate = SummaryResolutionCandidate & {
   model: string;
 };
 
-function buildSummarizerBreakerKey(params: {
-  candidate: ResolvedSummaryCandidate;
-  legacyAuthProfileId?: string;
-}): string {
-  const authProfileId = params.candidate.useLegacyAuthProfile
-    ? (params.legacyAuthProfileId ?? "-")
-    : "-";
-  return `provider:${params.candidate.provider};model:${params.candidate.model};authProfile:${authProfileId}`;
+/** Build the explicit runtime LLM model override attached to configured LCM models. */
+function buildRuntimeModelOverride(
+  candidate: ResolvedSummaryCandidate,
+): RuntimeLlmModelOverride | undefined {
+  const configField = candidate.runtimeModelOverrideField?.trim();
+  const configPath = candidate.runtimeModelOverrideConfigPath?.trim();
+  if (!configField || !configPath) {
+    return undefined;
+  }
+  return {
+    configField,
+    configPath,
+    modelRef: `${candidate.provider}/${candidate.model}`,
+  };
+}
+
+/** Read the host-bound runtime LLM completion capability from context engine runtime params. */
+function readRuntimeLlmComplete(params: unknown): RuntimeLlmCompleteFn | undefined {
+  if (!isRecord(params) || !isRecord(params.llm)) {
+    return undefined;
+  }
+  return typeof params.llm.complete === "function"
+    ? (params.llm.complete as RuntimeLlmCompleteFn)
+    : undefined;
+}
+
+function buildSummarizerBreakerKey(candidate: ResolvedSummaryCandidate): string {
+  return `provider:${candidate.provider};model:${candidate.model}`;
 }
 
 type SummaryMode = "normal" | "aggressive";
@@ -80,6 +108,13 @@ type ProviderAuthFailure = {
   missingModelRequestScope: boolean;
 };
 
+type ProviderResponseFailure = {
+  statusCode?: number;
+  message?: string;
+  code?: string;
+  finishReason?: string;
+};
+
 /**
  * Signals that the summarizer hit a provider-auth failure and callers should
  * avoid treating the result like an empty summary.
@@ -96,6 +131,62 @@ export class LcmProviderAuthError extends Error {
   }) {
     super(buildProviderAuthWarning(params));
     this.name = "LcmProviderAuthError";
+    this.provider = params.provider;
+    this.model = params.model;
+    this.failure = params.failure;
+  }
+}
+
+/**
+ * Signals that OpenClaw's runtime LLM policy denied an explicit model override
+ * requested by Lossless configuration. This must fail closed.
+ */
+export class LcmRuntimeLlmPolicyError extends Error {
+  readonly provider: string;
+  readonly model: string;
+  readonly configField: string;
+  readonly modelRef: string;
+
+  constructor(params: {
+    provider: string;
+    model: string;
+    configField: string;
+    modelRef: string;
+    message: string;
+  }) {
+    super(params.message);
+    this.name = "LcmRuntimeLlmPolicyError";
+    this.provider = params.provider;
+    this.model = params.model;
+    this.configField = params.configField;
+    this.modelRef = params.modelRef;
+  }
+}
+
+/**
+ * Signals that the host OpenClaw runtime is too old to expose the runtime LLM
+ * completion capability required for Lossless summarization.
+ */
+export class LcmRuntimeLlmUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LcmRuntimeLlmUnavailableError";
+  }
+}
+
+/** Signals that a provider returned an explicit non-auth error response. */
+class LcmProviderResponseError extends Error {
+  readonly provider: string;
+  readonly model: string;
+  readonly failure: ProviderResponseFailure;
+
+  constructor(params: {
+    provider: string;
+    model: string;
+    failure: ProviderResponseFailure;
+  }) {
+    super(buildProviderResponseWarning(params));
+    this.name = "LcmProviderResponseError";
     this.provider = params.provider;
     this.model = params.model;
     this.failure = params.failure;
@@ -126,55 +217,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
     );
   });
 }
-
-/** Normalize provider ids for stable config/profile lookup. */
-function normalizeProviderId(provider: string): string {
-  return provider.trim().toLowerCase();
-}
-
-/**
- * Resolve provider API override from legacy OpenClaw config.
- *
- * When model ids are custom/forward-compat, this hint allows deps.complete to
- * construct a valid pi-ai Model object even if getModel(provider, model) misses.
- */
-function resolveProviderApiFromLegacyConfig(
-  config: unknown,
-  provider: string,
-): string | undefined {
-  if (!config || typeof config !== "object") {
-    return undefined;
-  }
-  const providers = (config as { models?: { providers?: Record<string, unknown> } }).models
-    ?.providers;
-  if (!providers || typeof providers !== "object") {
-    return undefined;
-  }
-
-  const direct = providers[provider];
-  if (direct && typeof direct === "object") {
-    const api = (direct as { api?: unknown }).api;
-    if (typeof api === "string" && api.trim()) {
-      return api.trim();
-    }
-  }
-
-  const normalizedProvider = normalizeProviderId(provider);
-  for (const [entryProvider, value] of Object.entries(providers)) {
-    if (normalizeProviderId(entryProvider) !== normalizedProvider) {
-      continue;
-    }
-    if (!value || typeof value !== "object") {
-      continue;
-    }
-    const api = (value as { api?: unknown }).api;
-    if (typeof api === "string" && api.trim()) {
-      return api.trim();
-    }
-  }
-  return undefined;
-}
-
 
 /** Narrow unknown values to plain object records. */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -545,7 +587,131 @@ function buildProviderAuthWarning(params: {
     params.failure.message && !params.failure.missingModelRequestScope
       ? ` Detail: ${params.failure.message}`
       : "";
-  return `[lcm] compaction failed: ${detail}. Check that the configured summaryProvider has valid API credentials. Current: ${params.provider}/${params.model}${messageSuffix}`;
+  return `[lcm] compaction failed: ${detail}. Check OpenClaw runtime LLM auth and policy for the configured summary model. Current: ${params.provider}/${params.model}${messageSuffix}`;
+}
+
+function getProviderResponseFinishReason(value: Record<string, unknown>): string | undefined {
+  for (const key of ["finish_reason", "stopReason", "stop_reason", "status"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+function getProviderResponseErrorCode(value: Record<string, unknown>): string | undefined {
+  if (typeof value.code === "string" && value.code.trim()) {
+    return value.code.trim();
+  }
+  if (isRecord(value.error) && typeof value.error.code === "string" && value.error.code.trim()) {
+    return value.error.code.trim();
+  }
+  return undefined;
+}
+
+function getProviderResponseErrorMessage(value: Record<string, unknown>): string | undefined {
+  const textParts: string[] = [];
+  for (const key of ["errorMessage", "message"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      textParts.push(candidate.trim());
+    }
+  }
+  if (isRecord(value.error)) {
+    collectAuthFailureText(value.error, textParts);
+  }
+  return textParts.length > 0
+    ? truncateDiagnosticText(textParts.join(" ").replace(/\s+/g, " ").trim(), 240)
+    : undefined;
+}
+
+function extractProviderResponseFailure(value: unknown): ProviderResponseFailure | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  // Treat only structural provider-error signals as failures. A plain
+  // `errorMessage` string can be part of an overloaded empty response that the
+  // existing conservative retry path still knows how to recover from.
+  const statusCode = extractAuthFailureStatusCode(value);
+  const finishReason = getProviderResponseFinishReason(value);
+  const normalizedFinishReason = finishReason?.toLowerCase();
+  const nestedError = isRecord(value.error) ? value.error : undefined;
+  const nestedErrorKind = typeof nestedError?.kind === "string" ? nestedError.kind : undefined;
+  const hasExplicitErrorSignal =
+    normalizedFinishReason === "error" ||
+    normalizedFinishReason === "failed" ||
+    normalizedFinishReason === "cancelled" ||
+    (statusCode !== undefined && statusCode >= 400) ||
+    (nestedErrorKind !== undefined && nestedErrorKind !== "provider_auth");
+  if (!hasExplicitErrorSignal) {
+    return undefined;
+  }
+
+  const code = getProviderResponseErrorCode(value);
+  const message = getProviderResponseErrorMessage(value);
+  return {
+    ...(statusCode !== undefined ? { statusCode } : {}),
+    ...(finishReason ? { finishReason } : {}),
+    ...(code ? { code } : {}),
+    ...(message ? { message } : {}),
+  };
+}
+
+function extractRuntimeLlmPolicyFailure(value: unknown): {
+  configField: string;
+  modelRef: string;
+  message: string;
+} | undefined {
+  if (!isRecord(value) || !isRecord(value.error)) {
+    return undefined;
+  }
+  const error = value.error;
+  if (error.kind !== "runtime_llm_policy") {
+    return undefined;
+  }
+  const configField = typeof error.configField === "string" ? error.configField.trim() : "";
+  const modelRef = typeof error.modelRef === "string" ? error.modelRef.trim() : "";
+  const message = typeof error.message === "string" ? error.message.trim() : "";
+  if (!configField || !modelRef || !message) {
+    return undefined;
+  }
+  return { configField, modelRef, message };
+}
+
+function extractRuntimeLlmUnavailableFailure(value: unknown): string | undefined {
+  if (!isRecord(value) || !isRecord(value.error)) {
+    return undefined;
+  }
+  const message = typeof value.error.message === "string" ? value.error.message.trim() : "";
+  if (
+    value.error.kind !== "provider_error" ||
+    !message.includes("runtime.llm.complete is unavailable")
+  ) {
+    return undefined;
+  }
+  return message;
+}
+
+function buildProviderResponseWarning(params: {
+  provider: string;
+  model: string;
+  failure: ProviderResponseFailure;
+}): string {
+  const detailParts: string[] = [];
+  if (params.failure.statusCode !== undefined) {
+    detailParts.push(String(params.failure.statusCode));
+  }
+  if (params.failure.finishReason) {
+    detailParts.push(`finish=${params.failure.finishReason}`);
+  }
+  if (params.failure.code) {
+    detailParts.push(`code=${params.failure.code}`);
+  }
+  const detail = detailParts.length > 0 ? ` (${detailParts.join(" / ")})` : "";
+  const messageSuffix = params.failure.message ? ` Detail: ${params.failure.message}` : "";
+  return `[lcm] provider error response${detail}; provider=${params.provider}; model=${params.model}${messageSuffix}`;
 }
 
 /**
@@ -950,6 +1116,7 @@ function buildCondensedSummaryPrompt(params: {
  * whole compaction pass.
  */
 function buildDeterministicFallbackSummary(text: string, targetTokens: number): string {
+  if (typeof text !== "string") return "";
   const trimmed = text.trim();
   if (!trimmed) {
     return "";
@@ -998,6 +1165,16 @@ function resolveSummaryCandidates(params: {
     typeof params.legacyParams.provider === "string" ? params.legacyParams.provider.trim() : "";
   const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
+  const legacyModelConfigField =
+    typeof params.legacyParams.modelConfigField === "string" &&
+    params.legacyParams.modelConfigField.trim()
+      ? params.legacyParams.modelConfigField.trim()
+      : undefined;
+  const legacyModelConfigPath =
+    typeof params.legacyParams.modelConfigPath === "string" &&
+    params.legacyParams.modelConfigPath.trim()
+      ? params.legacyParams.modelConfigPath.trim()
+      : undefined;
   const runtimeConfig =
     params.legacyParams.config && typeof params.legacyParams.config === "object"
       ? (params.legacyParams.config as {
@@ -1018,7 +1195,12 @@ function resolveSummaryCandidates(params: {
           };
         })
       : undefined;
-  const nestedPluginConfig = runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config;
+  const directPluginConfig = params.deps.config as {
+    summaryModel?: unknown;
+    summaryProvider?: unknown;
+  };
+  const nestedPluginConfig =
+    runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config ?? directPluginConfig;
 
   const resolutionCandidates: SummaryResolutionCandidate[] = [
     {
@@ -1028,7 +1210,8 @@ function resolveSummaryCandidates(params: {
         process.env.LCM_SUMMARY_PROVIDER?.trim() ||
         (providerHint || undefined),
       hasExplicitProvider: Boolean(process.env.LCM_SUMMARY_PROVIDER?.trim()),
-      useLegacyAuthProfile: false,
+      runtimeModelOverrideField: "LCM_SUMMARY_MODEL",
+      runtimeModelOverrideConfigPath: "LCM_SUMMARY_MODEL",
     },
     {
       levelName: "plugin config (lossless-claw)",
@@ -1041,39 +1224,40 @@ function resolveSummaryCandidates(params: {
         typeof nestedPluginConfig?.summaryProvider === "string" &&
           nestedPluginConfig.summaryProvider.trim(),
       ),
-      useLegacyAuthProfile: false,
+      runtimeModelOverrideField: "summaryModel",
+      runtimeModelOverrideConfigPath: "plugins.entries.lossless-claw.config.summaryModel",
     },
     {
       levelName: "OpenClaw agents.defaults.compaction.model",
       modelRef: readModelRef(runtimeConfig?.agents?.defaults?.compaction?.model),
       providerHint: undefined,
       hasExplicitProvider: false,
-      useLegacyAuthProfile: false,
     },
     {
       levelName: "OpenClaw agents.defaults.model",
       modelRef: readModelRef(runtimeConfig?.agents?.defaults?.model),
       providerHint: undefined,
       hasExplicitProvider: false,
-      useLegacyAuthProfile: false,
     },
     {
       levelName: "legacy runtime/session model",
       modelRef: modelHint,
       providerHint: providerHint || undefined,
       hasExplicitProvider: Boolean(providerHint),
-      useLegacyAuthProfile: true,
+      runtimeModelOverrideField: legacyModelConfigField,
+      runtimeModelOverrideConfigPath: legacyModelConfigPath,
     },
   ];
 
   // Append explicit fallback providers from config.
-  for (const fb of params.deps.config.fallbackProviders ?? []) {
+  for (const [fallbackIndex, fb] of (params.deps.config.fallbackProviders ?? []).entries()) {
     resolutionCandidates.push({
       levelName: `explicit fallback (${fb.provider}/${fb.model})`,
       modelRef: `${fb.provider}/${fb.model}`,
       providerHint: fb.provider,
       hasExplicitProvider: true,
-      useLegacyAuthProfile: false,
+      runtimeModelOverrideField: "fallbackProviders",
+      runtimeModelOverrideConfigPath: `plugins.entries.lossless-claw.config.fallbackProviders[${fallbackIndex}]`,
     });
   }
 
@@ -1123,15 +1307,20 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     return undefined;
   }
 
-  const legacyAuthProfileId =
-    typeof params.legacyParams.authProfileId === "string" &&
-    params.legacyParams.authProfileId.trim()
-      ? params.legacyParams.authProfileId.trim()
+  const explicitAgentId =
+    typeof params.legacyParams.agentId === "string" && params.legacyParams.agentId.trim()
+      ? params.legacyParams.agentId.trim()
       : undefined;
-  const agentDir =
-    typeof params.legacyParams.agentDir === "string" && params.legacyParams.agentDir.trim()
-      ? params.legacyParams.agentDir.trim()
+  const sessionAgentId =
+    typeof params.legacyParams.sessionKey === "string"
+      ? params.deps.parseAgentSessionKey(params.legacyParams.sessionKey)?.agentId
       : undefined;
+  const agentId = explicitAgentId || sessionAgentId;
+  const runtimeLlmComplete = readRuntimeLlmComplete(params.legacyParams);
+  // OpenClaw only permits agentId override on host-bound/context-engine runtime LLM
+  // capabilities. Plugin-wide api.runtime.llm.complete is already scoped by the
+  // gateway and rejects unbound agentId overrides.
+  const shouldPassAgentId = !!runtimeLlmComplete && !!agentId;
 
   const condensedTargetTokens =
     Number.isFinite(params.deps.config.condensedTargetTokens) &&
@@ -1192,29 +1381,18 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const candidate = resolvedCandidates[index]!;
       const provider = candidate.provider;
       const model = candidate.model;
+      const runtimeModelOverride = buildRuntimeModelOverride(candidate);
       const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
-      const authProfileId = candidate.useLegacyAuthProfile ? legacyAuthProfileId : undefined;
-      const providerApi = resolveProviderApiFromLegacyConfig(params.legacyParams.config, provider);
-      const lookupOptions = {
-        profileId: authProfileId,
-        agentDir,
-        runtimeConfig: params.legacyParams.config,
-      };
-
       const runSummarizerCall = async (
-        requestApiKey: string | undefined,
         label: string,
         reasoning?: string,
-        options?: { skipModelAuth?: boolean },
       ) =>
         withTimeout(params.deps.complete({
           provider,
           model,
-          apiKey: requestApiKey,
-          providerApi,
-          authProfileId,
-          agentDir,
-          runtimeConfig: params.legacyParams.config,
+          ...(runtimeModelOverride ? { runtimeModelOverride } : {}),
+          ...(runtimeLlmComplete ? { runtimeLlmComplete } : {}),
+          ...(shouldPassAgentId ? { agentId } : {}),
           system: LCM_SUMMARIZER_SYSTEM_PROMPT,
           messages: [
             {
@@ -1223,102 +1401,63 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             },
           ],
           maxTokens: targetTokens,
+          reasoningIfSupported: "low",
           ...(reasoning ? { reasoning } : {}),
-          ...(options?.skipModelAuth === true ? { skipModelAuth: true } : {}),
         }), summarizerTimeoutMs, label);
-
-      const retryWithoutModelAuth = async (
-        failure: ProviderAuthFailure,
-        reasoning?: string,
-      ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
-        const initialAuthError = new LcmProviderAuthError({ provider, model, failure });
-        const runtimeManagedAuth = params.deps.isRuntimeManagedAuthProvider?.(provider, providerApi) === true;
-        if (runtimeManagedAuth) {
-          throw initialAuthError;
-        }
-        params.deps.log.warn(initialAuthError.message);
-        params.deps.log.warn(
-          `[lcm] summarizer auth retry: retrying ${provider}/${model} without runtime.modelAuth credentials.`,
-        );
-
-        const directApiKey = await params.deps.getApiKey(provider, model, {
-          ...lookupOptions,
-          skipModelAuth: true,
-        });
-        if (!directApiKey) {
-          params.deps.log.warn(
-            `[lcm] summarizer auth retry unavailable: no direct credentials found for ${provider}/${model}.`,
-          );
-          throw initialAuthError;
-        }
-
-        try {
-          const directResult = await runSummarizerCall(directApiKey, "auth-retry", reasoning, {
-            skipModelAuth: true,
-          });
-          // Use requireStructuralSignal on the retry success path too — the
-          // summary text may legitimately contain auth-error phrases.
-          const directFailure = extractProviderAuthFailure(directResult, {
-            requireStructuralSignal: true,
-          });
-          if (directFailure) {
-            const retryAuthError = new LcmProviderAuthError({
-              provider,
-              model,
-              failure: directFailure,
-            });
-            params.deps.log.warn(retryAuthError.message);
-            throw retryAuthError;
-          }
-          params.deps.log.info(
-            `[lcm] summarizer auth retry succeeded; provider=${provider}; model=${model}; source=direct-credentials`,
-          );
-          return directResult;
-        } catch (directErr) {
-          if (directErr instanceof LcmProviderAuthError) {
-            throw directErr;
-          }
-          // Catch path: real errors carry structural signals (HTTP 401, error.kind),
-          // so requireStructuralSignal is safe here too.
-          const directFailure = extractProviderAuthFailure(directErr, {
-            requireStructuralSignal: true,
-          });
-          if (directFailure) {
-            const retryAuthError = new LcmProviderAuthError({
-              provider,
-              model,
-              failure: directFailure,
-            });
-            params.deps.log.warn(retryAuthError.message);
-            throw retryAuthError;
-          }
-          throw directErr;
-        }
-      };
 
       const attemptSummarizerCall = async (
         label: string,
         reasoning?: string,
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
-        const apiKey = await params.deps.getApiKey(provider, model, lookupOptions);
         try {
-          const result = await runSummarizerCall(apiKey, label, reasoning);
+          const result = await runSummarizerCall(label, reasoning);
+          const policyFailure = extractRuntimeLlmPolicyFailure(result);
+          if (policyFailure) {
+            throw new LcmRuntimeLlmPolicyError({
+              provider,
+              model,
+              configField: policyFailure.configField,
+              modelRef: policyFailure.modelRef,
+              message: policyFailure.message,
+            });
+          }
+          const runtimeUnavailableFailure = extractRuntimeLlmUnavailableFailure(result);
+          if (runtimeUnavailableFailure) {
+            throw new LcmRuntimeLlmUnavailableError(runtimeUnavailableFailure);
+          }
           // Use requireStructuralSignal so that LLM summary text containing
           // auth-related words (e.g. "provider auth error") is NOT mistaken
           // for an actual API auth failure.
           const authFailure = extractProviderAuthFailure(result, {
             requireStructuralSignal: true,
           });
-          if (!authFailure) {
-            return result;
+          if (authFailure) {
+            throw new LcmProviderAuthError({ provider, model, failure: authFailure });
           }
-          return retryWithoutModelAuth(authFailure, reasoning);
+
+          const responseFailure = extractProviderResponseFailure(result);
+          if (responseFailure) {
+            throw new LcmProviderResponseError({
+              provider,
+              model,
+              failure: responseFailure,
+            });
+          }
+          return result;
         } catch (err) {
+          if (
+            err instanceof LcmRuntimeLlmPolicyError ||
+            err instanceof LcmRuntimeLlmUnavailableError ||
+            err instanceof LcmProviderAuthError ||
+            err instanceof LcmProviderResponseError
+          ) {
+            throw err;
+          }
           const authFailure = extractProviderAuthFailure(err);
           if (!authFailure) {
             throw err;
           }
-          return retryWithoutModelAuth(authFailure, reasoning);
+          throw new LcmProviderAuthError({ provider, model, failure: authFailure });
         }
       };
 
@@ -1326,8 +1465,17 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       try {
         result = await attemptSummarizerCall("initial");
       } catch (err) {
+        if (err instanceof LcmRuntimeLlmPolicyError) {
+          params.deps.log.error(err.message);
+          throw err;
+        }
+        if (err instanceof LcmRuntimeLlmUnavailableError) {
+          params.deps.log.error(err.message);
+          throw err;
+        }
         if (err instanceof LcmProviderAuthError) {
           lastAuthError = err;
+          params.deps.log.warn(err.message);
           if (nextCandidate) {
             params.deps.log.warn(
               `[lcm] PROVIDER FALLBACK: ${provider}/${model} auth failed → trying ${nextCandidate.provider}/${nextCandidate.model}`,
@@ -1337,6 +1485,18 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             continue;
           }
           throw lastAuthError;
+        }
+        if (err instanceof LcmProviderResponseError) {
+          params.deps.log.warn(err.message);
+          if (nextCandidate) {
+            params.deps.log.warn(
+              `[lcm] PROVIDER FALLBACK: ${provider}/${model} provider error → trying ${nextCandidate.provider}/${nextCandidate.model}`,
+            );
+            const backoffMs = Math.min(500 * Math.pow(2, index), 8000);
+            await new Promise((r) => setTimeout(r, backoffMs));
+            continue;
+          }
+          break;
         }
         const errMsg = err instanceof Error ? err.message : String(err);
         const isTimeout = errMsg.includes("summarizer timeout");
@@ -1374,7 +1534,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         if (envelopeNormalized.summary) {
           summary = envelopeNormalized.summary;
           summarySource = "envelope";
-          params.deps.log.info(
+          params.deps.log.debug(
             `[lcm] recovered summary from response envelope; provider=${provider}; model=${model}; ` +
               `block_types=${formatBlockTypes(envelopeNormalized.blockTypes)}; source=envelope`,
           );
@@ -1417,7 +1577,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
           if (summary) {
             summarySource = "retry";
-            params.deps.log.info(
+            params.deps.log.debug(
               `[lcm] retry succeeded; provider=${provider}; model=${model}; ` +
                 `block_types=${formatBlockTypes(retryEnvelopeNormalized.blockTypes)}; source=retry`,
             );
@@ -1443,8 +1603,17 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             summary = initialSummary;
           }
         } catch (retryErr) {
+          if (retryErr instanceof LcmRuntimeLlmPolicyError) {
+            params.deps.log.error(retryErr.message);
+            throw retryErr;
+          }
+          if (retryErr instanceof LcmRuntimeLlmUnavailableError) {
+            params.deps.log.error(retryErr.message);
+            throw retryErr;
+          }
           if (retryErr instanceof LcmProviderAuthError) {
             lastAuthError = retryErr;
+            params.deps.log.warn(retryErr.message);
             if (nextCandidate) {
               params.deps.log.warn(
                 `[lcm] PROVIDER FALLBACK: ${provider}/${model} auth failed on retry → trying ${nextCandidate.provider}/${nextCandidate.model}`,
@@ -1454,6 +1623,19 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               continue;
             }
             throw lastAuthError;
+          }
+          if (retryErr instanceof LcmProviderResponseError) {
+            params.deps.log.warn(retryErr.message);
+            if (nextCandidate) {
+              params.deps.log.warn(
+                `[lcm] PROVIDER FALLBACK: ${provider}/${model} provider error on retry → trying ${nextCandidate.provider}/${nextCandidate.model}`,
+              );
+              const backoffMs = Math.min(500 * Math.pow(2, index), 8000);
+              await new Promise((r) => setTimeout(r, backoffMs));
+              continue;
+            }
+            summary = initialSummary;
+            continue;
           }
           // Retry is best-effort; log and proceed to deterministic fallback.
           const retryErrMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
@@ -1480,7 +1662,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       }
 
       if (summarySource !== "content") {
-        params.deps.log.info(
+        params.deps.log.debug(
           `[lcm] summary resolved via non-content path; provider=${provider}; model=${model}; source=${summarySource}`,
         );
       }
@@ -1500,9 +1682,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   return {
     fn,
     model: resolvedCandidates[0]!.model,
-    breakerKey: buildSummarizerBreakerKey({
-      candidate: resolvedCandidates[0]!,
-      legacyAuthProfileId,
-    }),
+    breakerKey: buildSummarizerBreakerKey(resolvedCandidates[0]!),
   };
 }

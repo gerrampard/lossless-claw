@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,12 +7,20 @@ import { getLcmDbFeatures } from "../src/db/features.js";
 import { createLcmDatabaseConnection, closeLcmConnection } from "../src/db/connection.js";
 import { resolveLcmConfig } from "../src/db/config.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
+import { FocusBriefStore } from "../src/store/focus-brief-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
 import { createLcmCommand, __testing } from "../src/plugin/lcm-command.js";
 import type { LcmSummarizeFn } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
 
-function createCommandFixture(options?: { summarize?: LcmSummarizeFn; deps?: LcmDependencies }) {
+function createCommandFixture(options?: {
+  summarize?: LcmSummarizeFn;
+  deps?: LcmDependencies;
+  getLcm?: () => Promise<{
+    rotateSessionStorageWithBackup: (...args: unknown[]) => Promise<unknown>;
+    compact?: (...args: unknown[]) => Promise<unknown>;
+  }>;
+}) {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-command-"));
   const dbPath = join(tempDir, "lcm.db");
   const db = createLcmDatabaseConnection(dbPath);
@@ -26,8 +34,9 @@ function createCommandFixture(options?: { summarize?: LcmSummarizeFn; deps?: Lcm
     config,
     summarize: options?.summarize,
     deps: options?.deps,
+    getLcm: options?.getLcm,
   });
-  return { tempDir, dbPath, db, command, conversationStore, summaryStore };
+  return { tempDir, dbPath, db, config, command, conversationStore, summaryStore };
 }
 
 function createCommandContext(
@@ -63,6 +72,7 @@ describe("lcm command", () => {
   const dbPaths = new Set<string>();
 
   afterEach(() => {
+    vi.restoreAllMocks();
     for (const dbPath of dbPaths) {
       closeLcmConnection(dbPath);
     }
@@ -218,6 +228,669 @@ describe("lcm command", () => {
     expect(result.text).toContain("tokens in context: 5");
     expect(result.text).toContain("compression ratio: 1:6");
     expect(result.text).toContain("doctor: 1 issue(s) in this conversation");
+  });
+
+  it("reports focus usage when no brief exists for the current conversation", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    await fixture.conversationStore.createConversation({
+      sessionId: "focus-empty-session",
+      sessionKey: "agent:main:telegram:direct:focus-empty",
+      title: "Focus empty fixture",
+    });
+
+    const result = await fixture.command.handler(
+      createCommandContext("focus", {
+        sessionKey: "agent:main:telegram:direct:focus-empty",
+      }),
+    );
+
+    expect(result.text).toContain("Lossless Claw Focus");
+    expect(result.text).toContain("status: none");
+    expect(result.text).toContain("usage: `/lossless focus <prompt>`");
+  });
+
+  it("generates and persists an active focus brief through a delegated subagent", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const sessionKey = "agent:main:telegram:direct:focus-generate";
+    const lifecycleEvents: string[] = [];
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "focus-generate-session",
+      sessionKey,
+      title: "Focus generation fixture",
+    });
+    const [firstMessage, secondMessage] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "Alpha auth work started.",
+        tokenCount: 6,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "Alpha auth work reached the review stage.",
+        tokenCount: 8,
+      },
+    ]);
+    fixture.db
+      .prepare(`UPDATE messages SET created_at = ? WHERE conversation_id = ?`)
+      .run("2026-05-15 00:00:00", currentConversation.conversationId);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "focus_leaf",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Alpha auth implementation details.",
+      tokenCount: 50,
+      sourceMessageTokenCount: 14,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("focus_leaf", [
+      firstMessage.messageId,
+      secondMessage.messageId,
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "focus_parent",
+      conversationId: currentConversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: "Alpha auth current state and review notes.",
+      tokenCount: 20,
+      descendantTokenCount: 50,
+      sourceMessageTokenCount: 14,
+    });
+    await fixture.summaryStore.linkSummaryToParents("focus_parent", ["focus_leaf"]);
+    fixture.db
+      .prepare(`UPDATE summaries SET latest_at = ? WHERE summary_id = ?`)
+      .run("2026-05-15 00:00:00", "focus_parent");
+    await fixture.summaryStore.replaceContextRangeWithSummary({
+      conversationId: currentConversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 1,
+      summaryId: "focus_parent",
+    });
+
+    let agentRuns = 0;
+    let sessionReads = 0;
+    const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      if (request.method === "agent") {
+        agentRuns += 1;
+        lifecycleEvents.push(`agent-${agentRuns}`);
+        if (agentRuns === 1) {
+          expect(String(request.params?.message)).toContain("Gather Lossless focus evidence.");
+          expect(String(request.params?.message)).toContain("lcm_grep");
+          expect(String(request.params?.message)).toContain("do NOT call lcm_expand_query");
+        } else {
+          expect(String(request.params?.message)).toContain("Synthesize the final Lossless focus context brief.");
+          expect(String(request.params?.message)).toContain("Evidence dossier");
+        }
+        return { runId: `focus-run-${agentRuns}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionReads += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content:
+                sessionReads === 1
+                  ? JSON.stringify({
+                      evidenceMarkdown:
+                        "## Evidence Dossier\n- focus_parent cites alpha auth review state.\n- focus_leaf expands implementation details.",
+                      citedSummaryIds: ["focus_parent"],
+                      expandedSummaryIds: ["focus_leaf"],
+                      irrelevantSummaryIds: ["unrelated_summary"],
+                      expansionPrompts: [
+                        {
+                          prompt: "Expand the alpha auth implementation details.",
+                          summaryIds: ["focus_leaf"],
+                        },
+                      ],
+                      confidenceNotes: ["focus_parent was in active context"],
+                      truncated: false,
+                    })
+                  : JSON.stringify({
+                      briefMarkdown: `## Focused Narrative\n${"Alpha auth is ready for review. ".repeat(8_000)}`,
+                      citedSummaryIds: ["focus_parent"],
+                      expandedSummaryIds: ["focus_leaf"],
+                      irrelevantSummaryIds: ["unrelated_summary"],
+                      expansionPrompts: [
+                        {
+                          prompt: "Expand the alpha auth implementation details.",
+                          summaryIds: ["focus_leaf"],
+                        },
+                      ],
+                      confidenceNotes: ["focus_parent was in active context"],
+                      truncated: false,
+                    }),
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+    const deps = {
+      config: fixture.config,
+      complete: vi.fn(),
+      callGateway,
+      resolveModel: () => ({ provider: "test", model: "test-model" }),
+      parseAgentSessionKey: (key: string) => {
+        const match = /^agent:([^:]+):(.*)$/.exec(key);
+        return match ? { agentId: match[1] ?? "main", suffix: match[2] ?? "" } : null;
+      },
+      isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
+      normalizeAgentId: (id?: string) => id?.trim() || "main",
+      buildSubagentSystemPrompt: () => "subagent system prompt",
+      readLatestAssistantReply: (messages: unknown[]) => {
+        const latest = messages.at(-1) as { content?: unknown } | undefined;
+        return typeof latest?.content === "string" ? latest.content : undefined;
+      },
+      resolveAgentDir: () => fixture.tempDir,
+      resolveSessionIdFromSessionKey: async () => undefined,
+      resolveSessionTranscriptFile: async () => undefined,
+      agentLaneSubagent: "subagent",
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    } as unknown as LcmDependencies;
+    const compact = vi.fn(async () => {
+      lifecycleEvents.push("compact");
+      return { ok: true, compacted: true, reason: "forced full sweep" };
+    });
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      deps,
+      getLcm: async () => ({
+        compact,
+        rotateSessionStorageWithBackup: vi.fn(),
+      }),
+    });
+
+    const result = await command.handler(
+      createCommandContext("focus alpha auth review state", {
+        sessionKey,
+      }),
+    );
+
+    expect(result.text).toContain("Focus brief");
+    expect(result.text).toContain("Pre-focus compaction");
+    expect(result.text).toContain("compacted: yes");
+    expect(result.text).toContain("status: active");
+    expect(result.text).toContain("Alpha auth is ready for review.");
+    expect(lifecycleEvents.slice(0, 3)).toEqual(["compact", "agent-1", "agent-2"]);
+    expect(compact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "focus-generate-session",
+        sessionKey,
+        compactionTarget: "threshold",
+        force: true,
+      }),
+    );
+    expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
+      "agent",
+      "agent.wait",
+      "sessions.get",
+      "agent",
+      "agent.wait",
+      "sessions.get",
+      "sessions.delete",
+    ]);
+    const brief = fixture.db
+      .prepare(`SELECT brief_id, prompt, status, content, generator_run_id FROM focus_briefs`)
+      .get() as {
+      brief_id: string;
+      prompt: string;
+      status: string;
+      content: string;
+      generator_run_id: string;
+    };
+    expect(brief.prompt).toBe("alpha auth review state");
+    expect(brief.status).toBe("active");
+    expect(brief.content).toContain("Alpha auth is ready for review.");
+    expect(brief.generator_run_id).toBe("focus-run-2");
+    const sources = fixture.db
+      .prepare(`SELECT summary_id, role FROM focus_brief_sources ORDER BY role, summary_id`)
+      .all() as Array<{ summary_id: string; role: string }>;
+    expect(sources).toEqual([
+      { summary_id: "focus_parent", role: "active_input" },
+      { summary_id: "focus_parent", role: "cited" },
+      { summary_id: "focus_leaf", role: "expanded" },
+      { summary_id: "unrelated_summary", role: "irrelevant" },
+    ]);
+
+    const [postFocusMessage] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 2,
+        role: "user",
+        content: "Alpha auth post-focus review note.",
+        tokenCount: 9,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "focus_delta",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Alpha auth post-focus context.",
+      tokenCount: 11,
+      sourceMessageTokenCount: 9,
+      latestAt: new Date("2026-05-16T00:00:00Z"),
+    });
+    await fixture.summaryStore.linkSummaryToMessages("focus_delta", [postFocusMessage.messageId]);
+    await fixture.summaryStore.replaceContextRangeWithSummary({
+      conversationId: currentConversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      summaryId: "focus_delta",
+    });
+    const focusStore = new FocusBriefStore(fixture.db);
+    await focusStore.createFocusBrief({
+      conversationId: currentConversation.conversationId,
+      prompt: "failed refocus",
+      content: "",
+      status: "failed",
+      error: "generation timed out",
+      supersedeCurrentDrafts: false,
+    });
+
+    const status = await command.handler(
+      createCommandContext("focus", {
+        sessionKey,
+      }),
+    );
+    expect(status.text).toContain(`brief id: \`${brief.brief_id}\``);
+    expect(status.text).toContain("status: active");
+    expect(status.text).toContain("source summaries: 1");
+    expect(status.text).toContain("cited summaries: focus_parent");
+    expect(status.text).toContain("delta since focus: 1 messages, 1 summaries, ~20 tokens");
+    expect(status.text).toContain("stale: yes");
+    expect(status.text).toContain("source snapshot: obsolete");
+    expect(status.text).toContain("latest generation: failed");
+    expect(status.text).toContain("generation timed out");
+
+    const generalStatus = await command.handler(
+      createCommandContext("status", {
+        sessionKey,
+      }),
+    );
+    expect(generalStatus.text).toContain("**🎯 Focus**");
+    expect(generalStatus.text).toContain("status: active");
+    expect(generalStatus.text).toContain("delta since focus: 1 messages, 1 summaries, ~20 tokens");
+
+    const unfocus = await command.handler(
+      createCommandContext("unfocus", {
+        sessionKey,
+      }),
+    );
+    expect(unfocus.text).toContain("status: inactive");
+    expect(unfocus.text).toContain("deactivated briefs: 1");
+    expect(unfocus.text).toContain("Post-unfocus compaction");
+    expect(compact).toHaveBeenCalledTimes(2);
+    expect(
+      fixture.db
+        .prepare(`SELECT status FROM focus_briefs WHERE brief_id = ?`)
+        .get(brief.brief_id),
+    ).toEqual({ status: "inactive" });
+  });
+
+  it("refocuses an active focus brief from post-focus delta summaries", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const sessionKey = "agent:main:telegram:direct:refocus-generate";
+    const lifecycleEvents: string[] = [];
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "refocus-generate-session",
+      sessionKey,
+      title: "Refocus generation fixture",
+    });
+    const [oldMessage, deltaMessage] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "Original focus setup.",
+        tokenCount: 5,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "New delta after focus.",
+        tokenCount: 6,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "refocus_old",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Original focus source.",
+      tokenCount: 20,
+      sourceMessageTokenCount: 5,
+      latestAt: new Date("2026-05-15T00:00:00Z"),
+    });
+    await fixture.summaryStore.linkSummaryToMessages("refocus_old", [oldMessage.messageId]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "refocus_delta",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "New relevant delta for the original prompt.",
+      tokenCount: 30,
+      sourceMessageTokenCount: 6,
+      latestAt: new Date("2026-05-16T00:00:00Z"),
+    });
+    await fixture.summaryStore.linkSummaryToMessages("refocus_delta", [deltaMessage.messageId]);
+    await fixture.summaryStore.appendContextSummary(
+      currentConversation.conversationId,
+      "refocus_old",
+    );
+    await fixture.summaryStore.appendContextSummary(
+      currentConversation.conversationId,
+      "refocus_delta",
+    );
+    const focusStore = new FocusBriefStore(fixture.db);
+    const oldBrief = await focusStore.createFocusBrief({
+      conversationId: currentConversation.conversationId,
+      sessionKey,
+      prompt: "agent configuration",
+      content: "Existing focus brief baseline.",
+      status: "active",
+      tokenCount: 40,
+      targetTokens: 12_000,
+      coveredLatestAt: "2026-05-15T00:00:00.000Z",
+      coveredMessageSeq: 0,
+      sourceContextHash: "old-hash",
+      sources: [{ summaryId: "refocus_old", ordinal: 0, role: "active_input" }],
+      supersedeCurrentDrafts: true,
+    });
+
+    let agentRuns = 0;
+    let sessionReads = 0;
+    const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      if (request.method === "agent") {
+        agentRuns += 1;
+        lifecycleEvents.push(`agent-${agentRuns}`);
+        const message = String(request.params?.message);
+        if (agentRuns === 1) {
+          expect(message).toContain("Gather Lossless refocus delta evidence.");
+          expect(message).toContain("Existing focus brief baseline.");
+          expect(message).toContain("refocus_delta");
+          expect(message).not.toContain("refocus_old");
+        } else {
+          expect(message).toContain("Synthesize the refreshed Lossless focus context brief.");
+          expect(message).toContain("Existing focus brief baseline.");
+        }
+        return { runId: `refocus-run-${agentRuns}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionReads += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content:
+                sessionReads === 1
+                  ? JSON.stringify({
+                      evidenceMarkdown: "## Delta Evidence\n- refocus_delta updates agent configuration.",
+                      citedSummaryIds: ["refocus_delta"],
+                      expandedSummaryIds: ["refocus_delta"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["Delta only."],
+                      truncated: false,
+                    })
+                  : JSON.stringify({
+                      briefMarkdown: `Existing baseline plus refocus_delta update. ${"Merged relevant delta. ".repeat(8_000)}`,
+                      citedSummaryIds: ["refocus_delta"],
+                      expandedSummaryIds: ["refocus_delta"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["Merged relevant delta."],
+                      truncated: false,
+                    }),
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+    const deps = {
+      config: fixture.config,
+      complete: vi.fn(),
+      callGateway,
+      resolveModel: () => ({ provider: "test", model: "test-model" }),
+      parseAgentSessionKey: (key: string) => {
+        const match = /^agent:([^:]+):(.*)$/.exec(key);
+        return match ? { agentId: match[1] ?? "main", suffix: match[2] ?? "" } : null;
+      },
+      isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
+      normalizeAgentId: (id?: string) => id?.trim() || "main",
+      buildSubagentSystemPrompt: () => "subagent system prompt",
+      readLatestAssistantReply: (messages: unknown[]) => {
+        const latest = messages.at(-1) as { content?: unknown } | undefined;
+        return typeof latest?.content === "string" ? latest.content : undefined;
+      },
+      resolveAgentDir: () => fixture.tempDir,
+      resolveSessionIdFromSessionKey: async () => undefined,
+      resolveSessionTranscriptFile: async () => undefined,
+      agentLaneSubagent: "subagent",
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    } as unknown as LcmDependencies;
+    const compact = vi.fn(async () => {
+      lifecycleEvents.push("compact");
+      return { ok: true, compacted: true, reason: "forced full sweep" };
+    });
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      deps,
+      getLcm: async () => ({
+        compact,
+        rotateSessionStorageWithBackup: vi.fn(),
+      }),
+    });
+
+    const result = await command.handler(
+      createCommandContext("refocus", {
+        sessionKey,
+      }),
+    );
+
+    expect(result.text).toContain("Focus brief");
+    expect(result.text).toContain("status: active");
+    expect(result.text).toContain("delta summaries: 1");
+    expect(result.text).toContain("Existing baseline plus refocus_delta update.");
+    expect(lifecycleEvents.slice(0, 3)).toEqual(["compact", "agent-1", "agent-2"]);
+    const rows = fixture.db
+      .prepare(`SELECT brief_id, prompt, status, content FROM focus_briefs ORDER BY rowid`)
+      .all() as Array<{ brief_id: string; prompt: string; status: string; content: string }>;
+    expect(rows).toEqual([
+      expect.objectContaining({
+        brief_id: oldBrief.briefId,
+        prompt: "agent configuration",
+        status: "superseded",
+      }),
+      expect.objectContaining({
+        prompt: "agent configuration",
+        status: "active",
+        content: expect.stringContaining("Existing baseline plus refocus_delta update."),
+      }),
+    ]);
+    const sources = fixture.db
+      .prepare(`SELECT summary_id, role FROM focus_brief_sources ORDER BY role, summary_id`)
+      .all() as Array<{ summary_id: string; role: string }>;
+    expect(sources).toContainEqual({ summary_id: "refocus_delta", role: "active_input" });
+    expect(sources).toContainEqual({ summary_id: "refocus_delta", role: "cited" });
+  });
+
+  it("keeps the active focus brief when refocus generation fails", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const sessionKey = "agent:main:telegram:direct:refocus-fails";
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "refocus-fails-session",
+      sessionKey,
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "Delta message.",
+        tokenCount: 4,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "refocus_failed_delta",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Delta content.",
+      tokenCount: 10,
+      latestAt: new Date("2026-05-16T00:00:00Z"),
+    });
+    await fixture.summaryStore.linkSummaryToMessages("refocus_failed_delta", [message.messageId]);
+    await fixture.summaryStore.appendContextSummary(
+      currentConversation.conversationId,
+      "refocus_failed_delta",
+    );
+    const focusStore = new FocusBriefStore(fixture.db);
+    const active = await focusStore.createFocusBrief({
+      conversationId: currentConversation.conversationId,
+      sessionKey,
+      prompt: "agent configuration",
+      content: "Still active baseline.",
+      status: "active",
+      coveredLatestAt: "2026-05-15T00:00:00.000Z",
+      coveredMessageSeq: 0,
+      supersedeCurrentDrafts: true,
+    });
+    const deps = {
+      config: fixture.config,
+      complete: vi.fn(),
+      callGateway: vi.fn(async (request: { method: string }) => {
+        if (request.method === "agent") return { runId: "refocus-failed-run" };
+        if (request.method === "agent.wait") return { status: "timeout" };
+        if (request.method === "sessions.delete") return { ok: true };
+        throw new Error(`unexpected gateway method ${request.method}`);
+      }),
+      resolveModel: () => ({ provider: "test", model: "test-model" }),
+      parseAgentSessionKey: () => ({ agentId: "main", suffix: "test" }),
+      isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
+      normalizeAgentId: (id?: string) => id?.trim() || "main",
+      buildSubagentSystemPrompt: () => "subagent system prompt",
+      readLatestAssistantReply: () => undefined,
+      resolveAgentDir: () => fixture.tempDir,
+      resolveSessionIdFromSessionKey: async () => undefined,
+      resolveSessionTranscriptFile: async () => undefined,
+      agentLaneSubagent: "subagent",
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as LcmDependencies;
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      deps,
+      getLcm: async () => ({
+        compact: vi.fn(async () => ({ ok: true, compacted: true, reason: "forced full sweep" })),
+        rotateSessionStorageWithBackup: vi.fn(),
+      }),
+    });
+
+    const result = await command.handler(
+      createCommandContext("refocus", {
+        sessionKey,
+      }),
+    );
+
+    expect(result.text).toContain("Generation failed");
+    expect(
+      fixture.db.prepare(`SELECT status FROM focus_briefs WHERE brief_id = ?`).get(active.briefId),
+    ).toEqual({ status: "active" });
+  });
+
+  it("reports deferred compaction maintenance state in status output", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "maintenance-status-session",
+      sessionKey: "agent:main:telegram:maintenance:1",
+      title: "Maintenance fixture",
+    });
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           last_started_at,
+           last_finished_at,
+           last_failure_summary,
+           token_budget,
+           current_token_count,
+           updated_at
+         ) VALUES (?, 1, ?, ?, 0, ?, ?, ?, ?, ?, datetime('now'))`,
+      )
+      .run(
+        conversation.conversationId,
+        "2026-04-12T00:00:00.000Z",
+        "budget-trigger",
+        "2026-04-12T00:05:00.000Z",
+        "2026-04-12T00:07:00.000Z",
+        "provider timeout",
+        128_000,
+        96_000,
+      );
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        sessionKey: "agent:main:telegram:maintenance:1",
+        sessionId: "maintenance-status-session",
+      }),
+    );
+
+    expect(result.text).toContain("**🛠️ Maintenance**");
+    expect(result.text).toContain("state: pending");
+    expect(result.text).toContain("reason: budget-trigger");
+    expect(result.text).toContain("last failure: provider timeout");
+    expect(result.text).toContain("requested token budget: 128,000");
+    expect(result.text).toContain("observed token count: 96,000");
   });
 
   it("falls back to the active session id when the current session key is not stored yet", async () => {
@@ -970,8 +1643,6 @@ describe("lcm command", () => {
         const [provider, model] = String(modelRef ?? "anthropic/claude-haiku-4-5").split("/", 2);
         return { provider, model };
       }) as LcmDependencies["resolveModel"],
-      getApiKey: vi.fn(async () => "test-api-key") as LcmDependencies["getApiKey"],
-      requireApiKey: vi.fn(async () => "test-api-key") as LcmDependencies["requireApiKey"],
       parseAgentSessionKey: vi.fn(() => ({ agentId: "main", suffix: "test" })) as LcmDependencies["parseAgentSessionKey"],
       isSubagentSessionKey: vi.fn(() => false) as LcmDependencies["isSubagentSessionKey"],
       normalizeAgentId: vi.fn((id?: string) => id?.trim() || "main") as LcmDependencies["normalizeAgentId"],
@@ -979,6 +1650,7 @@ describe("lcm command", () => {
       readLatestAssistantReply: vi.fn(() => undefined) as LcmDependencies["readLatestAssistantReply"],
       resolveAgentDir: vi.fn(() => tmpdir()) as LcmDependencies["resolveAgentDir"],
       resolveSessionIdFromSessionKey: vi.fn(async () => undefined) as LcmDependencies["resolveSessionIdFromSessionKey"],
+      resolveSessionTranscriptFile: vi.fn(async () => undefined) as LcmDependencies["resolveSessionTranscriptFile"],
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -1048,6 +1720,546 @@ describe("lcm command", () => {
     expect(repaired?.content).not.toContain("[Truncated from 111 tokens]");
   });
 
+  it("creates a standalone database backup", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(createCommandContext("backup"));
+    const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
+
+    expect(result.text).toContain("💾 Lossless Claw Backup");
+    expect(result.text).toContain("status: created");
+    expect(result.text).toContain(`db path: ${fixture.dbPath}`);
+    expect(backupPath).toBeTruthy();
+    expect(existsSync(backupPath!)).toBe(true);
+  });
+
+  it("reports backup failure with structured output", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    vi.spyOn(fixture.db, "exec").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+
+    const result = await fixture.command.handler(createCommandContext("backup"));
+
+    expect(result.text).toContain("💾 Lossless Claw Backup");
+    expect(result.text).toContain("status: failed");
+    expect(result.text).toContain("reason: disk full");
+  });
+
+  it("rotates the current session and replaces the latest rotate backup", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
+    tempDirs.add(transcriptPath);
+
+    let currentConversationId = 0;
+    let mockedBackupPath = "";
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId,
+      currentMessageCount: 1,
+      backupPath: mockedBackupPath,
+      preservedTailMessageCount: 8,
+      checkpointSize: 1234,
+      bytesRemoved: 4567,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorageWithBackup,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "rotate-session",
+      sessionKey: "agent:main:main",
+    });
+    currentConversationId = currentConversation.conversationId;
+    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
+    writeFileSync(mockedBackupPath, "backup");
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-session",
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
+
+    expect(result.text).toContain("🪓 Lossless Claw Rotate");
+    expect(result.text).toContain("status: replaced latest");
+    expect(result.text).toContain("status: rotated");
+    expect(result.text).toContain("preserved tail messages: 8");
+    expect(result.text).toContain("bytes removed: 4,567");
+    expect(result.text).toContain("mode: preserved current conversation and rotated transcript tail");
+    expect(backupPath).toBeTruthy();
+    expect(backupPath?.endsWith(".rotate-latest.bak")).toBe(true);
+    expect(existsSync(backupPath!)).toBe(true);
+
+    const second = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-session",
+        sessionKey: "agent:main:main",
+      }),
+    );
+    const secondBackupPath = second.text.match(/backup path: (.+)/)?.[1]?.trim();
+    expect(secondBackupPath).toBe(backupPath);
+    expect(existsSync(secondBackupPath!)).toBe(true);
+
+    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
+      sessionId: "rotate-session",
+      sessionKey: "agent:main:main",
+      sessionFile: transcriptPath,
+      lockTimeoutMs: 30_000,
+    });
+  });
+
+  it("renders engine-reported rotate stats after waiting for other DB work", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-backup-fail-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
+    tempDirs.add(transcriptPath);
+
+    let currentConversationId = 0;
+    let mockedBackupPath = "";
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId,
+      currentMessageCount: 2,
+      backupPath: mockedBackupPath,
+      preservedTailMessageCount: 6,
+      checkpointSize: 1234,
+      bytesRemoved: 789,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorageWithBackup,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "rotate-backup-failure-session",
+      sessionKey: "agent:main:main",
+    });
+    currentConversationId = currentConversation.conversationId;
+    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
+    writeFileSync(mockedBackupPath, "backup");
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-backup-failure-session",
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    expect(result.text).toContain("🪓 Lossless Claw Rotate");
+    expect(result.text).toContain("messages: 2");
+    expect(result.text).toContain("status: replaced latest");
+    expect(result.text).toContain("status: rotated");
+    expect(result.text).toContain("preserved tail messages: 6");
+    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
+      sessionId: "rotate-backup-failure-session",
+      sessionKey: "agent:main:main",
+      sessionFile: transcriptPath,
+      lockTimeoutMs: 30_000,
+    });
+  });
+
+  it("resolves the runtime session id from the session key when rotate lacks ctx.sessionId", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-runtime-session-id-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
+    tempDirs.add(transcriptPath);
+
+    let currentConversationId = 0;
+    let mockedBackupPath = "";
+    const resolveSessionIdFromSessionKey = vi.fn(async () => "runtime-session-id");
+    const resolveSessionTranscriptFile = vi.fn(async () => transcriptPath);
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId,
+      currentMessageCount: 1,
+      backupPath: mockedBackupPath,
+      preservedTailMessageCount: 8,
+      checkpointSize: 1234,
+      bytesRemoved: 4567,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey,
+      resolveSessionTranscriptFile,
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorageWithBackup,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "stored-session-id",
+      sessionKey: "agent:main:main",
+    });
+    currentConversationId = currentConversation.conversationId;
+    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
+    writeFileSync(mockedBackupPath, "backup");
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    expect(result.text).toContain("status: rotated");
+    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
+    expect(resolveSessionTranscriptFile).toHaveBeenCalledWith({
+      sessionId: "runtime-session-id",
+      sessionKey: "agent:main:main",
+    });
+    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
+      sessionId: "runtime-session-id",
+      sessionKey: "agent:main:main",
+      sessionFile: transcriptPath,
+      lockTimeoutMs: 30_000,
+    });
+  });
+
+  it("falls back to the stored conversation session id when runtime rotate resolution is unavailable", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-stored-session-id-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
+    tempDirs.add(transcriptPath);
+
+    let currentConversationId = 0;
+    let mockedBackupPath = "";
+    const resolveSessionIdFromSessionKey = vi.fn(async () => undefined);
+    const resolveSessionTranscriptFile = vi.fn(async () => transcriptPath);
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId,
+      currentMessageCount: 1,
+      backupPath: mockedBackupPath,
+      preservedTailMessageCount: 8,
+      checkpointSize: 1234,
+      bytesRemoved: 4567,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey,
+      resolveSessionTranscriptFile,
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorageWithBackup,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "stored-session-id",
+      sessionKey: "agent:main:main",
+    });
+    currentConversationId = currentConversation.conversationId;
+    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
+    writeFileSync(mockedBackupPath, "backup");
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    expect(result.text).toContain("status: rotated");
+    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
+    expect(resolveSessionTranscriptFile).toHaveBeenCalledWith({
+      sessionId: "stored-session-id",
+      sessionKey: "agent:main:main",
+    });
+    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
+      sessionId: "stored-session-id",
+      sessionKey: "agent:main:main",
+      sessionFile: transcriptPath,
+      lockTimeoutMs: 30_000,
+    });
+  });
+
+  it("reports rotate as unavailable when no session id can be resolved for the live transcript", async () => {
+    const resolveSessionIdFromSessionKey = vi.fn(async () => undefined);
+    const resolveSessionTranscriptFile = vi.fn(async () => undefined);
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId: 0,
+      currentMessageCount: 0,
+      backupPath: "unused",
+      preservedTailMessageCount: 0,
+      checkpointSize: 0,
+      bytesRemoved: 0,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey,
+      resolveSessionTranscriptFile,
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorageWithBackup,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    await fixture.conversationStore.createConversation({
+      sessionId: "",
+      sessionKey: "agent:main:main",
+    });
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    expect(result.text).toContain("🪓 Lossless Claw Rotate");
+    expect(result.text).toContain("status: unavailable");
+    expect(result.text).toContain("did not expose or resolve a runtime session id");
+    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
+    expect(resolveSessionTranscriptFile).not.toHaveBeenCalled();
+    expect(rotateSessionStorageWithBackup).not.toHaveBeenCalled();
+  });
+
+  it("reports rotate failure when the engine reports a backup failure", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-backup-fail-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
+    tempDirs.add(transcriptPath);
+
+    let currentConversationId = 0;
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "backup_failed" as const,
+      currentConversationId,
+      currentMessageCount: 1,
+      reason: "SQLITE_BUSY",
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorageWithBackup,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "rotate-backup-failure-session",
+      sessionKey: "agent:main:main",
+    });
+    currentConversationId = currentConversation.conversationId;
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-backup-failure-session",
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    expect(result.text).toContain("🪓 Lossless Claw Rotate");
+    expect(result.text).toContain("status: failed");
+    expect(result.text).toContain("reason: SQLITE_BUSY");
+    expect(rotateSessionStorageWithBackup).toHaveBeenCalled();
+  });
+
+  it("reports rotate failure after the engine already created a backup", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-engine-fail-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
+    tempDirs.add(transcriptPath);
+
+    let currentConversationId = 0;
+    let mockedBackupPath = "";
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotate_failed" as const,
+      currentConversationId,
+      currentMessageCount: 1,
+      backupPath: mockedBackupPath,
+      reason: "rotate exploded",
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorageWithBackup,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "rotate-engine-failure-session",
+      sessionKey: "agent:main:main",
+    });
+    currentConversationId = currentConversation.conversationId;
+    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
+    writeFileSync(mockedBackupPath, "backup");
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-engine-failure-session",
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    expect(result.text).toContain("🪓 Lossless Claw Rotate");
+    expect(result.text).toContain("status: replaced latest");
+    expect(result.text).toContain("status: failed");
+    expect(result.text).toContain("reason: rotate exploded");
+    expect(result.text).toContain("backup path:");
+  });
+
+  it("reports rotate as unavailable when OpenClaw does not expose a session key", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-missing-session-key",
+      }),
+    );
+
+    expect(result.text).toContain("🪓 Lossless Claw Rotate");
+    expect(result.text).toContain("status: unavailable");
+    expect(result.text).toContain("OpenClaw must expose the active session key");
+  });
+
+  it("prefers the active conversation when multiple rows share the same session key", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "shared-key-old",
+      sessionKey: "agent:main:main",
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "shared-key-new",
+      sessionKey: "agent:main:main",
+    });
+
+    const result = await fixture.command.handler(
+      createCommandContext("status", {
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    expect(result.text).toContain(`conversation id: ${active.conversationId}`);
+    expect(result.text).not.toContain(`conversation id: ${archived.conversationId}`);
+  });
+
+  it("prefers the active conversation when session_id fallback rows share the same timestamp", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "shared-session-id",
+      sessionKey: "agent:main:archived",
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "shared-session-id",
+      sessionKey: "agent:main:active",
+    });
+
+    const tiedTimestamp = "2026-04-11 22:57:00";
+    fixture.db
+      .prepare(`UPDATE conversations SET created_at = ? WHERE conversation_id IN (?, ?)`)
+      .run(tiedTimestamp, archived.conversationId, active.conversationId);
+
+    const result = await fixture.command.handler(
+      createCommandContext("status", {
+        sessionId: "shared-session-id",
+      }),
+    );
+
+    expect(result.text).toContain(`conversation id: ${active.conversationId}`);
+    expect(result.text).not.toContain(`conversation id: ${archived.conversationId}`);
+  });
+
   it("falls back to help text for unsupported subcommands", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -1055,6 +2267,8 @@ describe("lcm command", () => {
 
     const result = await fixture.command.handler(createCommandContext("rewrite"));
     expect(result.text).toContain("⚠️ Unknown subcommand `rewrite`.");
+    expect(result.text).toContain("`/lossless backup`");
+    expect(result.text).toContain("`/lossless rotate`");
     expect(result.text).toContain("`/lossless help`");
     expect(result.text).toContain("`/lcm` is accepted as a shorter alias.");
   });
@@ -1115,7 +2329,17 @@ describe("lcm command", () => {
 });
 
 describe("lcm command helpers", () => {
-  it("treats native alias and empty slot states as selected defaults", () => {
+  it("parses focus command forms without flag syntax", () => {
+    expect(__testing.parseLcmCommand("focus alpha auth review")).toEqual({
+      kind: "focus_generate",
+      prompt: "alpha auth review",
+    });
+    expect(__testing.parseLcmCommand("focus")).toEqual({ kind: "focus_status" });
+    expect(__testing.parseLcmCommand("refocus")).toEqual({ kind: "refocus" });
+    expect(__testing.parseLcmCommand("unfocus")).toEqual({ kind: "unfocus" });
+  });
+
+  it("treats only the canonical engine id and empty slot state as selected", () => {
     expect(__testing.resolvePluginSelected({})).toBe(true);
     expect(
       __testing.resolvePluginSelected({
@@ -1125,7 +2349,7 @@ describe("lcm command helpers", () => {
           },
         },
       }),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       __testing.resolvePluginSelected({
         plugins: {

@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import type { ConversationStore, CreateMessagePartInput } from "./store/conversation-store.js";
+import { contentFromParts } from "./assembler.js";
+import type {
+  ConversationStore,
+  CreateMessagePartInput,
+  MessagePartRecord,
+  MessageRecord,
+  MessageRole,
+} from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
 import { extractFileIdsFromContent } from "./large-files.js";
@@ -11,6 +18,10 @@ import { LcmProviderAuthError } from "./summarize.js";
 export interface CompactionDecision {
   shouldCompact: boolean;
   reason: "threshold" | "manual" | "none";
+  /** Persisted Lossless context tokens before runtime prompt overhead. */
+  storedTokens: number;
+  /** Runtime-observed prompt tokens, when supplied by the host. */
+  observedTokens?: number;
   currentTokens: number;
   threshold: number;
 }
@@ -36,16 +47,22 @@ export interface CompactionConfig {
   contextThreshold: number;
   /** Number of fresh tail turns to protect (default 8) */
   freshTailCount: number;
+  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  freshTailMaxTokens?: number;
   /** Minimum number of depth-0 summaries needed for condensation. */
   leafMinFanout: number;
   /** Minimum number of depth>=1 summaries needed for condensation. */
   condensedMinFanout: number;
   /** Relaxed minimum fanout for hard-trigger sweeps. */
   condensedMinFanoutHard: number;
-  /** Incremental depth passes to run after each leaf compaction (default 1). */
-  incrementalMaxDepth: number;
+  /** Preferred source depth for routine full-sweep condensation (default 1). */
+  sweepMaxDepth?: number;
+  /** Deprecated alias for sweepMaxDepth. */
+  incrementalMaxDepth?: number;
   /** Max source tokens to compact per leaf/condensed chunk (default 20000) */
   leafChunkTokens?: number;
+  /** Optional target for summarized-prefix tokens after a full sweep. */
+  summaryPrefixTargetTokens?: number;
   /** Target tokens for leaf summaries (default 600) */
   leafTargetTokens: number;
   /** Target tokens for condensed summaries (default 900) */
@@ -186,8 +203,23 @@ const MEDIA_PATH_RE = /^MEDIA:\/.+$/;
 const EMBEDDED_DATA_URL_RE = /data:[^;\s"'`]+;base64,[A-Za-z0-9+/=\s]+/gi;
 const MEDIA_ATTACHMENT_PART_TYPES = new Set(["file", "snapshot"]);
 const MEDIA_ATTACHMENT_RAW_TYPES = new Set(["file", "image", "snapshot"]);
+const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking"]);
 const STRUCTURED_MEDIA_TEXT_KEYS = ["text", "caption", "alt", "title", "summary"] as const;
-const STRUCTURED_MEDIA_NESTED_KEYS = ["content", "parts", "items", "message", "messages"] as const;
+const STRUCTURED_MEDIA_NESTED_KEYS = [
+  "content",
+  "parts",
+  "items",
+  "message",
+  "messages",
+  "input",
+  "arguments",
+  "output",
+  "result",
+  "results",
+  "data",
+  "query",
+  "command",
+] as const;
 
 const CONDENSED_MIN_INPUT_RATIO = 0.1;
 
@@ -220,6 +252,7 @@ function parseMessagePartMetadata(part: CreateMessagePartInput | { metadata: str
 
 /** Detect whether a string is mostly binary/base64 payload and not meaningful prose. */
 function looksLikeBinaryPayload(value: string): boolean {
+  if (typeof value !== "string") return false;
   const trimmed = value.trim();
   if (!trimmed) {
     return false;
@@ -239,6 +272,7 @@ function looksLikeBinaryPayload(value: string): boolean {
 
 /** Strip attachment payloads from plain strings before they reach the summarizer. */
 function stripEmbeddedMediaPayloads(content: string): string {
+  if (typeof content !== "string") return "";
   const withoutDataUrls = content.replace(EMBEDDED_DATA_URL_RE, "[embedded media omitted]");
   const sanitizedLines = withoutDataUrls
     .split(/\r?\n/)
@@ -277,6 +311,9 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
 
   const record = value as Record<string, unknown>;
   const rawType = typeof record.type === "string" ? record.type.trim().toLowerCase() : "";
+  if (PROVIDER_REASONING_RAW_TYPES.has(rawType)) {
+    return [];
+  }
   const textFragments: string[] = [];
 
   for (const key of STRUCTURED_MEDIA_TEXT_KEYS) {
@@ -303,6 +340,7 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
 
 /** Normalize message content down to human-readable text, excluding binary/media payloads. */
 function extractMeaningfulMessageText(content: string): string {
+  if (typeof content !== "string") return "";
   const trimmed = content.trim();
   if (!trimmed) {
     return "";
@@ -319,6 +357,74 @@ function extractMeaningfulMessageText(content: string): string {
     }
   }
   return stripEmbeddedMediaPayloads(content);
+}
+
+/** Map stored message roles back to runtime roles for structured reconstruction. */
+function runtimeRoleForSummary(role: MessageRole): "user" | "assistant" | "toolResult" {
+  if (role === "tool") {
+    return "toolResult";
+  }
+  if (role === "user" || role === "system") {
+    return "user";
+  }
+  return "assistant";
+}
+
+/** Parse JSON-ish message-part values while preserving plain text values. */
+function parseStoredPartValue(value: string | null | undefined): unknown {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return trimmed;
+  }
+}
+
+/** Extract summarizable text from a structured runtime content value. */
+function extractMeaningfulStructuredText(value: unknown): string {
+  if (typeof value === "string") {
+    return extractMeaningfulMessageText(value);
+  }
+  const extracted = extractSanitizedStructuredText(value)
+    .map((fragment) => fragment.trim())
+    .filter(Boolean);
+  if (extracted.length > 0) {
+    return extracted.join("\n").trim();
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" ? extractMeaningfulMessageText(serialized) : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Extract a readable fallback from one structured message part. */
+function extractMessagePartSummaryText(part: MessagePartRecord): string {
+  const sections: string[] = [];
+  const text = extractMeaningfulStructuredText(part.textContent);
+  if (text) {
+    sections.push(text);
+  }
+
+  const toolName = part.toolName?.trim();
+  const toolLabel = toolName ? ` (${toolName})` : "";
+  const input = extractMeaningfulStructuredText(parseStoredPartValue(part.toolInput));
+  if (input) {
+    sections.push(`Tool input${toolLabel}:\n${input}`);
+  }
+  const output = extractMeaningfulStructuredText(parseStoredPartValue(part.toolOutput));
+  if (output) {
+    sections.push(`Tool output${toolLabel}:\n${output}`);
+  }
+
+  return sections.join("\n\n").trim();
 }
 
 /** Identify whether a stored message part represents a media attachment. */
@@ -415,6 +521,8 @@ export class CompactionEngine {
       return {
         shouldCompact: true,
         reason: "threshold",
+        storedTokens,
+        ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
         currentTokens,
         threshold,
       };
@@ -423,6 +531,8 @@ export class CompactionEngine {
     return {
       shouldCompact: false,
       reason: "none",
+      storedTokens,
+      ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
       currentTokens,
       threshold,
     };
@@ -432,8 +542,8 @@ export class CompactionEngine {
    * Evaluate whether the raw-message leaf trigger is active.
    *
    * Counts message tokens outside the protected fresh tail and compares against
-   * `leafChunkTokens`. This lets callers trigger a soft incremental leaf pass
-   * before the full context threshold is breached.
+   * `leafChunkTokens`. Automatic compaction no longer uses this as a trigger,
+   * but it remains useful for diagnostics and explicit maintenance commands.
    */
   async evaluateLeafTrigger(conversationId: number, leafChunkTokensOverride?: number): Promise<{
     shouldCompact: boolean;
@@ -459,6 +569,8 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    /** Optional persisted-context target used when host runtime overhead is known. */
+    stopAtTokens?: number;
     summaryModel?: string;
   }): Promise<CompactionResult> {
     return this.withContextCache(() => this.compactFullSweep(input));
@@ -467,7 +579,8 @@ export class CompactionEngine {
   /**
    * Run a single leaf pass against the oldest compactable raw chunk.
    *
-   * This is the soft-trigger path used for incremental maintenance.
+   * This lower-level helper is used by focused compaction tests and explicit
+   * leaf-pass callers; automatic maintenance uses threshold full sweeps.
    */
   async compactLeaf(input: {
     conversationId: number;
@@ -490,6 +603,7 @@ export class CompactionEngine {
     force?: boolean;
     previousSummaryContent?: string;
     summaryModel?: string;
+    allowCondensedPasses?: boolean;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force } = input;
 
@@ -553,11 +667,11 @@ export class CompactionEngine {
     let createdSummaryId = leafResult.summaryId;
     let level = leafResult.level;
 
-    const incrementalMaxDepth = this.resolveIncrementalMaxDepth();
+    const sweepMaxDepth = this.resolveSweepMaxDepth();
     const condensedMinChunkTokens = this.resolveCondensedMinChunkTokens();
     let runningTokens = tokensAfterLeaf;
-    if (incrementalMaxDepth > 0 && input.allowCondensedPasses !== false) {
-      for (let targetDepth = 0; targetDepth < incrementalMaxDepth; targetDepth++) {
+    if (sweepMaxDepth > 0 && input.allowCondensedPasses !== false) {
+      for (let targetDepth = 0; targetDepth < sweepMaxDepth; targetDepth++) {
         const fanout = this.resolveFanoutForDepth(targetDepth, false);
         const chunk = await this.selectOldestChunkAtDepth(conversationId, targetDepth);
         if (chunk.items.length < fanout || chunk.summaryTokens < condensedMinChunkTokens) {
@@ -608,7 +722,7 @@ export class CompactionEngine {
   }
 
   /**
-   * Run a hard-trigger sweep:
+   * Run a threshold-triggered full sweep:
    *
    * Phase 1: repeatedly compact raw-message chunks outside the fresh tail.
    * Phase 2: repeatedly condense oldest summary chunks while chunk utilization
@@ -620,15 +734,26 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    /** Optional persisted-context target used when host runtime overhead is known. */
+    stopAtTokens?: number;
     summaryModel?: string;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const stopAtTokens =
+      typeof input.stopAtTokens === "number" &&
+      Number.isFinite(input.stopAtTokens) &&
+      input.stopAtTokens > 0
+        ? Math.floor(input.stopAtTokens)
+        : undefined;
 
-    if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
+    if (
+      !force &&
+      tokensBefore <= threshold &&
+      (stopAtTokens === undefined || tokensBefore <= stopAtTokens)
+    ) {
       return {
         actionTaken: false,
         tokensBefore,
@@ -654,6 +779,7 @@ export class CompactionEngine {
     let previousSummaryContent: string | undefined;
     let previousTokens = tokensBefore;
     let hadAuthFailure = false;
+    let stoppedForNoProgress = false;
 
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
     // Delta tracking: maintain a running token count instead of re-querying DB
@@ -693,10 +819,6 @@ export class CompactionEngine {
       previousSummaryContent = leafResult.content;
       runningTokens = passTokensAfter;
 
-      if (!force && passTokensAfter <= threshold) {
-        previousTokens = passTokensAfter;
-        break;
-      }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
@@ -704,13 +826,28 @@ export class CompactionEngine {
     }
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
-    while (force || previousTokens > threshold) {
+    const preferredMaxSourceDepth = this.resolveSweepMaxDepth();
+    const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(tokenBudget);
+    const hasSummaryPrefixPressure = async (): Promise<boolean> =>
+      (await this.countSummaryTokensOutsideFreshTail(conversationId)) > summaryPrefixTargetTokens;
+    const hasStopTargetPressure = (): boolean =>
+      stopAtTokens !== undefined && runningTokens > stopAtTokens;
+    const hasCondensationPressure = async (): Promise<boolean> =>
+      hasStopTargetPressure() || await hasSummaryPrefixPressure();
+
+    const runCondensationPass = async (params: {
+      enforcePreferredDepth: boolean;
+      useHardFanout: boolean;
+    }): Promise<"progress" | "no-candidate" | "depth-cap" | "auth-failure" | "no-progress"> => {
       const candidate = await this.selectShallowestCondensationCandidate({
         conversationId,
-        hardTrigger: hardTrigger === true,
+        hardTrigger: params.useHardFanout,
       });
       if (!candidate) {
-        break;
+        return "no-candidate";
+      }
+      if (params.enforcePreferredDepth && candidate.targetDepth >= preferredMaxSourceDepth) {
+        return "depth-cap";
       }
 
       const passTokensBefore = runningTokens;
@@ -723,7 +860,7 @@ export class CompactionEngine {
       );
       if (!condenseResult) {
         hadAuthFailure = true;
-        break;
+        return "auth-failure";
       }
       const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
       await this.persistCompactionEvents({
@@ -741,14 +878,49 @@ export class CompactionEngine {
       level = condenseResult.level;
       runningTokens = passTokensAfter;
 
+      if (stopAtTokens !== undefined && passTokensAfter <= stopAtTokens) {
+        previousTokens = passTokensAfter;
+        return "progress";
+      }
       if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
-        break;
+        return "progress";
       }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
-        break;
+        return "no-progress";
       }
       previousTokens = passTokensAfter;
+      return "progress";
+    };
+
+    while (await hasCondensationPressure()) {
+      const status = await runCondensationPass({
+        enforcePreferredDepth: true,
+        useHardFanout: hardTrigger === true,
+      });
+      if (status !== "progress") {
+        if (status === "no-progress") {
+          stoppedForNoProgress = true;
+        }
+        break;
+      }
+    }
+
+    while (
+      !hadAuthFailure &&
+      !stoppedForNoProgress &&
+      await hasCondensationPressure()
+    ) {
+      const status = await runCondensationPass({
+        enforcePreferredDepth: false,
+        useHardFanout: true,
+      });
+      if (status !== "progress") {
+        if (status === "no-progress") {
+          stoppedForNoProgress = true;
+        }
+        break;
+      }
     }
 
     const tokensAfter = runningTokens;
@@ -890,16 +1062,29 @@ export class CompactionEngine {
     return 0;
   }
 
+  /** Normalize configured fresh tail token cap to a safe non-negative integer. */
+  private resolveFreshTailMaxTokens(): number | undefined {
+    if (
+      typeof this.config.freshTailMaxTokens === "number" &&
+      Number.isFinite(this.config.freshTailMaxTokens) &&
+      this.config.freshTailMaxTokens >= 0
+    ) {
+      return Math.floor(this.config.freshTailMaxTokens);
+    }
+    return undefined;
+  }
+
   /**
    * Compute the ordinal boundary for protected fresh messages.
    *
    * Messages with ordinal >= returned value are preserved as fresh tail.
    */
-  private resolveFreshTailOrdinal(contextItems: ContextItemRecord[]): number {
+  private async resolveFreshTailOrdinal(contextItems: ContextItemRecord[]): Promise<number> {
     const freshTailCount = this.resolveFreshTailCount();
     if (freshTailCount <= 0) {
       return Infinity;
     }
+    const freshTailMaxTokens = this.resolveFreshTailMaxTokens();
 
     const rawMessageItems = contextItems.filter(
       (item) => item.itemType === "message" && item.messageId != null,
@@ -908,8 +1093,35 @@ export class CompactionEngine {
       return Infinity;
     }
 
-    const tailStartIdx = Math.max(0, rawMessageItems.length - freshTailCount);
-    return rawMessageItems[tailStartIdx]?.ordinal ?? Infinity;
+    let protectedCount = 0;
+    let protectedTokens = 0;
+    let tailStartOrdinal = Infinity;
+
+    for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
+      if (protectedCount >= freshTailCount) {
+        break;
+      }
+
+      const item = rawMessageItems[idx];
+      if (!item || item.messageId == null) {
+        continue;
+      }
+
+      const messageTokens = await this.getMessageTokenCount(item.messageId);
+      const wouldExceedBudget =
+        protectedCount > 0 &&
+        typeof freshTailMaxTokens === "number" &&
+        protectedTokens + messageTokens > freshTailMaxTokens;
+      if (wouldExceedBudget) {
+        break;
+      }
+
+      tailStartOrdinal = item.ordinal;
+      protectedCount++;
+      protectedTokens += messageTokens;
+    }
+
+    return tailStartOrdinal;
   }
 
   /** Resolve message token count with a content-length fallback. */
@@ -931,7 +1143,7 @@ export class CompactionEngine {
   /** Sum raw message tokens outside the protected fresh tail. */
   private async countRawTokensOutsideFreshTail(conversationId: number): Promise<number> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     let rawTokens = 0;
 
     for (const item of contextItems) {
@@ -947,6 +1159,28 @@ export class CompactionEngine {
     return rawTokens;
   }
 
+  /** Sum summary tokens outside the protected fresh tail. */
+  private async countSummaryTokensOutsideFreshTail(conversationId: number): Promise<number> {
+    const contextItems = await this.getContextItemsCached(conversationId);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
+    let summaryTokens = 0;
+
+    for (const item of contextItems) {
+      if (item.ordinal >= freshTailOrdinal) {
+        break;
+      }
+      if (item.itemType !== "summary" || item.summaryId == null) {
+        continue;
+      }
+      const summary = await this.summaryStore.getSummary(item.summaryId);
+      if (summary) {
+        summaryTokens += this.resolveSummaryTokenCount(summary);
+      }
+    }
+
+    return summaryTokens;
+  }
+
   /**
    * Select the oldest contiguous raw-message chunk outside fresh tail.
    *
@@ -958,7 +1192,7 @@ export class CompactionEngine {
     leafChunkTokensOverride?: number,
   ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
 
     let rawTokensOutsideTail = 0;
@@ -1041,7 +1275,7 @@ export class CompactionEngine {
         continue;
       }
       const summary = await this.summaryStore.getSummary(item.summaryId);
-      const content = summary?.content.trim();
+      const content = typeof summary?.content === "string" ? summary.content.trim() : "";
       if (content) {
         summaryContents.push(content);
       }
@@ -1111,15 +1345,36 @@ export class CompactionEngine {
     return 2;
   }
 
-  private resolveIncrementalMaxDepth(): number {
+  private resolveSweepMaxDepth(): number {
+    const configured =
+      typeof this.config.sweepMaxDepth === "number" && Number.isFinite(this.config.sweepMaxDepth)
+        ? this.config.sweepMaxDepth
+        : this.config.incrementalMaxDepth;
     if (
-      typeof this.config.incrementalMaxDepth === "number" &&
-      Number.isFinite(this.config.incrementalMaxDepth)
+      typeof configured === "number" &&
+      Number.isFinite(configured)
     ) {
-      if (this.config.incrementalMaxDepth < 0) return Infinity;
-      if (this.config.incrementalMaxDepth > 0) return Math.floor(this.config.incrementalMaxDepth);
+      if (configured < 0) return Infinity;
+      if (configured > 0) return Math.floor(configured);
     }
     return 0;
+  }
+
+  /** Resolve the summarized-prefix pressure target for this token budget. */
+  private resolveSummaryPrefixTargetTokens(tokenBudget: number): number {
+    if (
+      typeof this.config.summaryPrefixTargetTokens === "number" &&
+      Number.isFinite(this.config.summaryPrefixTargetTokens) &&
+      this.config.summaryPrefixTargetTokens > 0
+    ) {
+      return Math.floor(this.config.summaryPrefixTargetTokens);
+    }
+    const threshold = Math.max(1, Math.floor(this.config.contextThreshold * tokenBudget));
+    const derivedTarget = Math.floor(threshold * 0.5);
+    return Math.max(
+      this.config.condensedTargetTokens,
+      Math.min(this.resolveLeafChunkTokens(), derivedTarget),
+    );
   }
   private resolveFanoutForDepth(targetDepth: number, hardTrigger: boolean): number {
     if (hardTrigger) {
@@ -1147,7 +1402,7 @@ export class CompactionEngine {
   }): Promise<CondensedPhaseCandidate | null> {
     const { conversationId, hardTrigger } = params;
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     const minChunkTokens = this.resolveCondensedMinChunkTokens();
     const depthLevels = await this.summaryStore.getDistinctDepthsInContext(conversationId, {
       maxOrdinalExclusive: freshTailOrdinal,
@@ -1187,7 +1442,7 @@ export class CompactionEngine {
     const freshTailOrdinal =
       typeof freshTailOrdinalOverride === "number"
         ? freshTailOrdinalOverride
-        : this.resolveFreshTailOrdinal(contextItems);
+        : await this.resolveFreshTailOrdinal(contextItems);
     const chunkTokenBudget = this.resolveLeafChunkTokens();
 
     const chunk: ContextItemRecord[] = [];
@@ -1263,7 +1518,7 @@ export class CompactionEngine {
       if (!summary || summary.depth !== targetDepth) {
         continue;
       }
-      const content = summary.content.trim();
+      const content = typeof summary.content === "string" ? summary.content.trim() : "";
       if (content) {
         summaryContents.push(content);
       }
@@ -1289,7 +1544,7 @@ export class CompactionEngine {
     /** Target token count for this summary kind (leaf or condensed). Used for hard-cap enforcement. */
     targetTokens: number;
   }): Promise<{ content: string; level: CompactionLevel } | null> {
-    const sourceText = params.sourceText.trim();
+    const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
       return {
         content: "[Truncated from 0 tokens]",
@@ -1387,8 +1642,9 @@ export class CompactionEngine {
   private async annotateMediaContent(
     messageId: number,
     content: string,
+    preloadedParts?: MessagePartRecord[],
   ): Promise<string> {
-    const parts = await this.conversationStore.getMessageParts(messageId);
+    const parts = preloadedParts ?? (await this.conversationStore.getMessageParts(messageId));
     const hasMediaParts = parts.some((part) => isMediaAttachmentPart(part));
     if (!hasMediaParts) {
       return content;
@@ -1414,6 +1670,48 @@ export class CompactionEngine {
     return `${meaningfulText} [with media attachment]`;
   }
 
+  /**
+   * Reconstruct the text used by leaf summaries from stored message data.
+   *
+   * Plain `messages.content` is preferred when present, but structured tool
+   * calls/results often store their actual payload in `message_parts` while the
+   * fallback content column is empty. Rehydrating through the assembler helper
+   * keeps compaction aligned with the prompt assembly path.
+   */
+  private async resolveLeafSummaryMessageContent(msg: MessageRecord): Promise<string> {
+    const parts = await this.conversationStore.getMessageParts(msg.messageId);
+    const annotatedContent = await this.annotateMediaContent(
+      msg.messageId,
+      msg.content,
+      parts,
+    );
+    const storedText = extractMeaningfulMessageText(annotatedContent);
+    if (storedText) {
+      return storedText;
+    }
+
+    if (parts.length === 0) {
+      return "";
+    }
+
+    const rehydrated = contentFromParts(
+      parts.map((part) => ({ ...part })),
+      runtimeRoleForSummary(msg.role),
+      msg.content,
+    );
+    const rehydratedText = extractMeaningfulStructuredText(rehydrated);
+    if (rehydratedText) {
+      return rehydratedText;
+    }
+
+    return parts
+      .map(extractMessagePartSummaryText)
+      .map((text) => text.trim())
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+  }
+
   // ── Private: Leaf Pass ───────────────────────────────────────────────────
 
   /**
@@ -1435,13 +1733,9 @@ export class CompactionEngine {
       }
       const msg = await this.conversationStore.getMessageById(item.messageId);
       if (msg) {
-        const annotatedContent = await this.annotateMediaContent(
-          msg.messageId,
-          msg.content,
-        );
         messageContents.push({
           messageId: msg.messageId,
-          content: annotatedContent,
+          content: await this.resolveLeafSummaryMessageContent(msg),
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
         });
@@ -1449,7 +1743,15 @@ export class CompactionEngine {
     }
 
     const concatenated = messageContents
-      .map((message) => `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${message.content}`)
+      .map((message) => {
+        // Strip provider reasoning/thinking blocks (e.g. {type:"thinking",thinkingSignature:"..."})
+        // so encrypted signatures and non-visible metadata don't pollute the summary.
+        // The raw message content is preserved in the DB for conversation history and prompt caching.
+        const text = extractMeaningfulMessageText(message.content);
+        if (!text) return null;
+        return `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${text}`;
+      })
+      .filter((s): s is string => s !== null)
       .join("\n\n");
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
